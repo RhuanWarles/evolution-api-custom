@@ -954,6 +954,7 @@ export class ChatwootService {
         source_id: sourceId,
         content_attributes: {
           ...replyToIds,
+          ...(messageBody?.key ? { whatsapp_message_key: messageBody.key } : {}),
         },
         source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
       },
@@ -1251,6 +1252,7 @@ export class ChatwootService {
         media: media,
         delay: 1200,
         quoted: options?.quoted,
+        ...(options?.mentioned?.length ? { mentioned: options.mentioned } : {}),
       };
 
       sendTelemetry('/message/sendMedia');
@@ -1451,6 +1453,13 @@ export class ChatwootService {
           return { message: 'bot' };
         }
 
+        const selectedMentions = body.content_attributes?.whatsapp_mentions;
+        const mentioned = chatId.endsWith('@g.us') && Array.isArray(selectedMentions)
+          ? [...new Set<string>(selectedMentions
+              .map((mention) => mention.lid || mention.jid)
+              .filter((jid) => typeof jid === 'string' && /^\d+@(lid|s\.whatsapp\.net)$/.test(jid)))]
+          : [];
+
         let formatText: string;
         if (senderName === null || senderName === undefined) {
           formatText = messageReceived;
@@ -1473,6 +1482,7 @@ export class ChatwootService {
 
               const options: Options = {
                 quoted: await this.getQuotedMessage(body, instance),
+                ...(mentioned.length ? { mentioned } : {}),
               };
 
               const messageSent = await this.sendAttachment(
@@ -1503,6 +1513,7 @@ export class ChatwootService {
             const data: SendTextDto = {
               number: chatId,
               text: formatText,
+              ...(mentioned.length ? { mentioned } : {}),
               delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
               quoted: await this.getQuotedMessage(body, instance),
             };
@@ -1635,6 +1646,12 @@ export class ChatwootService {
     if (this.isImportHistoryAvailable()) {
       try {
         await chatwootImport.updateMessageSourceID(chatwootMessageIds.messageId, key.id);
+        // Confirm through Rails so status/error changes reach the conversation websocket.
+        await chatwootRequest(this.getClientCwConfig(), {
+          method: 'PATCH',
+          url: `/api/v1/accounts/${this.provider.accountId}/conversations/${chatwootMessageIds.conversationId}/messages/${chatwootMessageIds.messageId}`,
+          body: { status: 'sent', external_error: null },
+        });
       } catch (error) {
         this.logger.error(`Error updating Chatwoot message source ID: ${error}`);
       }
@@ -1947,6 +1964,42 @@ export class ChatwootService {
     return messageContent;
   }
 
+
+  private async forwardGroupReaction(instance: InstanceDto, body: any) {
+    const reaction = body.message.reactionMessage;
+    if (!body.key.remoteJid.endsWith('@g.us')) return;
+    const provider = await this.getProvider(instance);
+    const target = await this.prismaRepository.message.findFirst({
+      where: {
+        instanceId: this.waMonitor.waInstances[instance.instanceName].instanceId,
+        AND: [
+          { key: { path: ['id'], equals: reaction.key.id } },
+          { key: { path: ['remoteJid'], equals: body.key.remoteJid } },
+        ],
+      },
+    });
+    if (!target?.chatwootConversationId) {
+      this.logger.warn('[reaction] target mapping unavailable; no timeline message created');
+      return;
+    }
+    const timestamp = reaction.senderTimestampMs != null
+      ? Long.fromValue(reaction.senderTimestampMs).toNumber()
+      : Long.fromValue(body.messageTimestamp).toNumber() * 1000;
+    await axios.post(
+      `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${target.chatwootConversationId}/reaction_events`,
+      { reaction: {
+        target_id: reaction.key.id, group_jid: body.key.remoteJid,
+        event_id: body.key.id, from_me: body.key.fromMe,
+        participant: body.key.participant || '', name: body.pushName,
+        emoji: reaction.text || '', timestamp_ms: timestamp,
+      } },
+      { headers: {
+        api_access_token: provider.token,
+        'X-Evolution-Reaction-Key': this.configService.get<any>('AUTHENTICATION').API_KEY.KEY,
+      }, timeout: 25000 },
+    );
+  }
+
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
     try {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
@@ -2003,6 +2056,11 @@ export class ChatwootService {
           body.message = {
             ...body.message?.ephemeralMessage?.message,
           };
+        }
+
+        if (body.message?.reactionMessage) {
+          await this.forwardGroupReaction(instance, body);
+          return;
         }
 
         const originalMessage = await this.getConversationMessage(body.message);
@@ -2140,30 +2198,6 @@ export class ChatwootService {
 
             return send;
           }
-        }
-
-        if (reactionMessage) {
-          if (reactionMessage.text) {
-            const send = await this.createMessage(
-              instance,
-              getConversation,
-              reactionMessage.text,
-              messageType,
-              false,
-              [],
-              {
-                message: { extendedTextMessage: { contextInfo: { stanzaId: reactionMessage.key.id } } },
-              },
-              'WAID:' + body.key.id,
-              quotedMsg,
-            );
-            if (!send) {
-              this.logger.warn('message not sent');
-              return;
-            }
-          }
-
-          return;
         }
 
         if (isInteractiveButtonMessage) {

@@ -39,6 +39,18 @@ lerna-debug.log*
 /store
 *.env
 
+# Production/runtime artifacts
+*.map
+*.tar
+*.tar.gz
+/dist
+/logs
+/tmp
+/cache
+container-before.json
+instances-before.json
+installed-main.js.map
+
 /temp/*
 
 .DS_Store
