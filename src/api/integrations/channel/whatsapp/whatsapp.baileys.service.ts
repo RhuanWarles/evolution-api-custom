@@ -1733,6 +1733,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly groupHandler = {
     'groups.upsert': (groupMetadata: GroupMetadata[]) => {
       this.sendDataWebhook(Events.GROUPS_UPSERT, groupMetadata);
+
+      groupMetadata.forEach((group) => {
+        if (isJidGroup(group.id)) {
+          void this.syncGroupChatwootMetadata(group.id, group);
+        }
+      });
     },
 
     'groups.update': (groupMetadataUpdate: Partial<GroupMetadata>[]) => {
@@ -1740,7 +1746,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       groupMetadataUpdate.forEach((group) => {
         if (isJidGroup(group.id)) {
-          this.updateGroupMetadataCache(group.id);
+          void this.syncGroupChatwootMetadata(group.id);
         }
       });
     },
@@ -1809,6 +1815,25 @@ export class BaileysStartupService extends ChannelStartupService {
       this.updateGroupMetadataCache(participantsUpdate.id);
     },
   };
+
+  private async syncGroupChatwootMetadata(groupJid: string, metadata?: Partial<GroupMetadata>) {
+    try {
+      if (!this.instance.name) return;
+
+      const group = metadata || (await this.updateGroupMetadataCache(groupJid));
+      if (!group?.subject) return;
+
+      const picture = await this.profilePicture(groupJid);
+      await this.chatwootService.syncGroupContactMetadata({ instanceName: this.instance.name }, groupJid, {
+        subject: group.subject,
+        profilePictureUrl: picture?.profilePictureUrl,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Group Chatwoot metadata sync failed for ${groupJid}: ${error instanceof Error ? error.message : 'unknown error'}`,
+      );
+    }
+  }
 
   private readonly labelHandle = {
     [Events.LABELS_EDIT]: async (label: Label) => {

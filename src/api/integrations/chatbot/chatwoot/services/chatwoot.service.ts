@@ -14,6 +14,7 @@ import {
   normalizeWhatsAppPhoneWithPlus,
   selectPreferredPhoneContact,
 } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
+import { buildGroupContactUpdate } from '@api/integrations/chatbot/chatwoot/utils/group-contact-metadata';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -406,6 +407,27 @@ export class ChatwootService {
     }
   }
 
+  public async syncGroupContactMetadata(
+    instance: InstanceDto,
+    groupJid: string,
+    metadata: { subject?: string | null; profilePictureUrl?: string | null },
+  ) {
+    try {
+      const contact = await this.findContact(instance, groupJid);
+      if (!contact?.id) return contact;
+
+      const update = buildGroupContactUpdate(contact, metadata);
+      if (Object.keys(update).length === 0) return contact;
+
+      return (await this.updateContact(instance, contact.id, update)) || contact;
+    } catch (error) {
+      this.logger.warn(
+        `Group contact metadata sync failed for ${groupJid}: ${error instanceof Error ? error.message : 'unknown error'}`,
+      );
+      return null;
+    }
+  }
+
   public async addLabelToContact(nameInbox: string, contactId: number) {
     try {
       const uri = this.configService.get<Chatwoot>('CHATWOOT').IMPORT.DATABASE.CONNECTION.URI;
@@ -754,7 +776,7 @@ export class ChatwootService {
           this.logger.verbose(`Group metadata: JID:${group.JID} - Subject:${group?.subject || group?.Name}`);
 
           const participantJid = isLid && !body.key.fromMe ? body.key.participantAlt : body.key.participant;
-          nameContact = `${group.subject} (GROUP)`;
+          nameContact = group.subject;
 
           const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
             participantJid.split('@')[0],
@@ -817,14 +839,14 @@ export class ChatwootService {
             const waProfilePictureFile =
               picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
             const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
-            const pictureNeedsUpdate = waProfilePictureFile !== chatwootProfilePictureFile;
-            const nameNeedsUpdate = !contact.name || contact.name === chatId;
+            const pictureNeedsUpdate =
+              Boolean(waProfilePictureFile) && waProfilePictureFile !== chatwootProfilePictureFile;
+            const nameNeedsUpdate = isGroup ? contact.name !== nameContact : !contact.name || contact.name === chatId;
             this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
             this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
             if (pictureNeedsUpdate || nameNeedsUpdate) {
               const updatedContact = await this.updateContact(instance, contact.id, {
                 ...(nameNeedsUpdate && { name: nameContact }),
-                ...(waProfilePictureFile === '' && { avatar: null }),
                 ...(pictureNeedsUpdate && { avatar_url: picture_url?.profilePictureUrl }),
               });
               contact = updatedContact || contact;
