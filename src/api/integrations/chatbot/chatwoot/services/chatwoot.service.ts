@@ -3,6 +3,11 @@ import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/d
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import {
+  contactIdentifierCandidates,
+  findContactByIdentifiers,
+  findExactContactByIdentifier,
+} from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -433,46 +438,21 @@ export class ChatwootService {
       return null;
     }
 
-    // Direct search by query (q) - most common way to search by identifier/email/phone
-    const contact = (await (client as any).get('contacts/search', {
-      params: {
-        q: identifier,
-        sort: 'name',
-      },
-    })) as any;
-
-    const records = contact?.data?.payload || contact?.payload || [];
-    const exactContact = records.find((record) => record.identifier === identifier);
-    if (exactContact) return exactContact;
-
-    // Fallback for older API versions or different response structures
-    // Try search by attribute
-    const contactByAttr = (await (client as any).post('contacts/filter', {
-      payload: [
-        {
-          attribute_key: 'identifier',
-          filter_operator: 'equal_to',
-          values: [identifier],
-          query_operator: null,
-        },
-      ],
-    })) as any;
-
-    const attributeRecords = contactByAttr?.payload || contactByAttr?.data?.payload || [];
-    const exactAttributeContact = attributeRecords.find((record) => record.identifier === identifier);
-    if (exactAttributeContact) return exactAttributeContact;
-
-    // Check inside data property if using axios interceptors wrapper
-    return null;
+    return findExactContactByIdentifier(client.contacts, this.provider.accountId, identifier, this.logger);
   }
 
   private async findContactForMessage(instance: InstanceDto, body: any, phoneNumber: string, query: string) {
-    const identifiers = [body.key.remoteJid, phoneNumber].filter(
-      (identifier) => typeof identifier === 'string' && identifier.includes('@'),
+    const identifiers = contactIdentifierCandidates(body, phoneNumber);
+    const client = await this.clientCw(instance);
+    if (!client) return { contact: null, fallback: null, identifierContact: null };
+
+    const resolvedIdentifier = await findContactByIdentifiers(
+      client.contacts,
+      this.provider.accountId,
+      identifiers,
+      this.logger,
     );
-    const contactByIdentifier = (
-      await Promise.all(identifiers.map((identifier) => this.findContactByIdentifier(instance, identifier)))
-    ).find(Boolean);
+    const contactByIdentifier = resolvedIdentifier.contact;
     const phoneContacts = await this.findContactsByPhone(instance, query);
     const contactByPhone = this.selectContactByPhone(phoneContacts, query);
 
