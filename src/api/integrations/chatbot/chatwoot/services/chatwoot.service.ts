@@ -362,7 +362,7 @@ export class ChatwootService {
     }
   }
 
-  public async updateContact(instance: InstanceDto, id: number, data: any) {
+  public async updateContact(instance: InstanceDto, id: number, data: any): Promise<any> {
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -441,15 +441,11 @@ export class ChatwootService {
       },
     })) as any;
 
-    if (contact && contact.data && contact.data.payload && contact.data.payload.length > 0) {
-      return contact.data.payload[0];
-    }
+    const records = contact?.data?.payload || contact?.payload || [];
+    const exactContact = records.find((record) => record.identifier === identifier);
+    if (exactContact) return exactContact;
 
     // Fallback for older API versions or different response structures
-    if (contact && contact.payload && contact.payload.length > 0) {
-      return contact.payload[0];
-    }
-
     // Try search by attribute
     const contactByAttr = (await (client as any).post('contacts/filter', {
       payload: [
@@ -462,16 +458,54 @@ export class ChatwootService {
       ],
     })) as any;
 
-    if (contactByAttr && contactByAttr.payload && contactByAttr.payload.length > 0) {
-      return contactByAttr.payload[0];
-    }
+    const attributeRecords = contactByAttr?.payload || contactByAttr?.data?.payload || [];
+    const exactAttributeContact = attributeRecords.find((record) => record.identifier === identifier);
+    if (exactAttributeContact) return exactAttributeContact;
 
     // Check inside data property if using axios interceptors wrapper
-    if (contactByAttr && contactByAttr.data && contactByAttr.data.payload && contactByAttr.data.payload.length > 0) {
-      return contactByAttr.data.payload[0];
+    return null;
+  }
+
+  private async findContactForMessage(instance: InstanceDto, body: any, phoneNumber: string, query: string) {
+    const identifiers = [body.key.remoteJid, phoneNumber].filter(
+      (identifier) => typeof identifier === 'string' && identifier.includes('@'),
+    );
+    const contactByIdentifier = (
+      await Promise.all(identifiers.map((identifier) => this.findContactByIdentifier(instance, identifier)))
+    ).find(Boolean);
+    const phoneContacts = await this.findContactsByPhone(instance, query);
+    const contactByPhone = this.selectContactByPhone(phoneContacts, query);
+
+    if (contactByIdentifier && contactByPhone && contactByIdentifier.id !== contactByPhone.id) {
+      this.logger.warn(
+        `Contact identity conflict; preferring identifier contact=${contactByIdentifier.id} phone_contact=${contactByPhone.id}`,
+      );
     }
 
-    return null;
+    return {
+      contact: contactByIdentifier || contactByPhone,
+      fallback: contactByPhone,
+      identifierContact: contactByIdentifier,
+    };
+  }
+
+  private async findContactsByPhone(instance: InstanceDto, phoneNumber: string) {
+    const client = await this.clientCw(instance);
+    if (!client) return [];
+
+    const contact = (await chatwootRequest(this.getClientCwConfig(), {
+      method: 'POST',
+      url: `/api/v1/accounts/${this.provider.accountId}/contacts/filter`,
+      body: { payload: this.getFilterPayload(`+${phoneNumber}`) },
+    })) as any;
+
+    return Array.isArray(contact?.payload) ? contact.payload : [];
+  }
+
+  private selectContactByPhone(contacts: any[], query: string) {
+    if (!contacts.length) return null;
+    const phoneNumbers = this.getNumbers(`+${query}`);
+    return contacts.find((contact) => phoneNumbers.includes(contact.phone_number)) || contacts[0];
   }
 
   public async findContact(instance: InstanceDto, phoneNumber: string) {
@@ -641,29 +675,6 @@ export class ChatwootService {
     if (!client) return null;
 
     try {
-      // Processa atualização de contatos já criados @lid
-      if (phoneNumber && remoteJid && !isGroup) {
-        const contact = await this.findContact(instance, phoneNumber.split('@')[0]);
-        if (contact && contact.identifier !== remoteJid) {
-          this.logger.verbose(
-            `Identifier needs update: (contact.identifier: ${contact.identifier}, phoneNumber: ${phoneNumber}, body.key.remoteJidAlt: ${remoteJid}`,
-          );
-          const updateContact = await this.updateContact(instance, contact.id, {
-            identifier: phoneNumber,
-            phone_number: `+${phoneNumber.split('@')[0]}`,
-          });
-
-          if (updateContact === null) {
-            const baseContact = await this.findContact(instance, phoneNumber.split('@')[0]);
-            if (baseContact) {
-              await this.mergeContacts(baseContact.id, contact.id);
-              this.logger.verbose(
-                `Merge contacts: (${baseContact.id}) ${baseContact.phone_number} and (${contact.id}) ${contact.phone_number}`,
-              );
-            }
-          }
-        }
-      }
       this.logger.verbose(`--- Start createConversation ---`);
       this.logger.verbose(`Instance: ${JSON.stringify(instance)}`);
 
@@ -770,7 +781,24 @@ export class ChatwootService {
         this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
         this.logger.verbose(`Searching contact for: ${chatId}`);
-        let contact = await this.findContact(instance, chatId);
+        const resolvedContact = isGroup
+          ? { contact: await this.findContact(instance, chatId), fallback: null, identifierContact: null }
+          : await this.findContactForMessage(instance, body, phoneNumber, chatId);
+        let contact = resolvedContact.contact;
+
+        if (
+          contact &&
+          !isGroup &&
+          !resolvedContact.identifierContact &&
+          phoneNumber &&
+          contact.identifier !== phoneNumber
+        ) {
+          contact =
+            (await this.updateContact(instance, contact.id, {
+              identifier: phoneNumber,
+              phone_number: `+${phoneNumber.split('@')[0]}`,
+            })) || contact;
+        }
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
@@ -783,11 +811,12 @@ export class ChatwootService {
             this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
             this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
             if (pictureNeedsUpdate || nameNeedsUpdate) {
-              contact = await this.updateContact(instance, contact.id, {
+              const updatedContact = await this.updateContact(instance, contact.id, {
                 ...(nameNeedsUpdate && { name: nameContact }),
                 ...(waProfilePictureFile === '' && { avatar: null }),
                 ...(pictureNeedsUpdate && { avatar_url: picture_url?.profilePictureUrl }),
               });
+              contact = updatedContact || contact;
             }
           }
         } else {
@@ -810,19 +839,18 @@ export class ChatwootService {
         const contactId = contact?.payload?.id || contact?.payload?.contact?.id || contact?.id;
         this.logger.verbose(`Contact ID: ${contactId}`);
 
-        const contactConversations = (await client.contacts.listConversations({
-          accountId: this.provider.accountId,
-          id: contactId,
-        })) as any;
-
-        if (!contactConversations || !contactConversations.payload) {
-          this.logger.error(`No conversations found or payload is undefined`);
-          return null;
+        const contactCandidates = [contact, resolvedContact.fallback]
+          .filter(Boolean)
+          .filter((candidate, index, candidates) => candidates.findIndex((item) => item.id === candidate.id) === index);
+        let contactConversations: any[] = [];
+        for (const candidate of contactCandidates) {
+          const conversations = (await client.contacts.listConversations({
+            accountId: this.provider.accountId,
+            id: candidate.id,
+          })) as any;
+          contactConversations = [...contactConversations, ...(conversations?.payload || [])];
         }
-
-        let inboxConversation = contactConversations.payload.find(
-          (conversation) => conversation.inbox_id == filterInbox.id,
-        );
+        let inboxConversation = contactConversations.find((conversation) => conversation.inbox_id == filterInbox.id);
         if (inboxConversation) {
           if (this.provider.reopenConversation) {
             this.logger.verbose(
@@ -838,7 +866,7 @@ export class ChatwootService {
               });
             }
           } else {
-            inboxConversation = contactConversations.payload.find(
+            inboxConversation = contactConversations.find(
               (conversation) =>
                 conversation && conversation.status !== 'resolved' && conversation.inbox_id == filterInbox.id,
             );
@@ -1454,11 +1482,16 @@ export class ChatwootService {
         }
 
         const selectedMentions = body.content_attributes?.whatsapp_mentions;
-        const mentioned = chatId.endsWith('@g.us') && Array.isArray(selectedMentions)
-          ? [...new Set<string>(selectedMentions
-              .map((mention) => mention.lid || mention.jid)
-              .filter((jid) => typeof jid === 'string' && /^\d+@(lid|s\.whatsapp\.net)$/.test(jid)))]
-          : [];
+        const mentioned =
+          chatId.endsWith('@g.us') && Array.isArray(selectedMentions)
+            ? [
+                ...new Set<string>(
+                  selectedMentions
+                    .map((mention) => mention.lid || mention.jid)
+                    .filter((jid) => typeof jid === 'string' && /^\d+@(lid|s\.whatsapp\.net)$/.test(jid)),
+                ),
+              ]
+            : [];
 
         let formatText: string;
         if (senderName === null || senderName === undefined) {
@@ -1964,17 +1997,21 @@ export class ChatwootService {
     return messageContent;
   }
 
-
-  private async forwardGroupReaction(instance: InstanceDto, body: any) {
+  private async forwardReaction(instance: InstanceDto, body: any) {
     const reaction = body.message.reactionMessage;
-    if (!body.key.remoteJid.endsWith('@g.us')) return;
     const provider = await this.getProvider(instance);
+    const targetRemoteJid = reaction.key?.remoteJid;
+    if (!targetRemoteJid) {
+      this.logger.warn('[reaction] target remote JID unavailable; no timeline message created');
+      return;
+    }
+
     const target = await this.prismaRepository.message.findFirst({
       where: {
         instanceId: this.waMonitor.waInstances[instance.instanceName].instanceId,
         AND: [
           { key: { path: ['id'], equals: reaction.key.id } },
-          { key: { path: ['remoteJid'], equals: body.key.remoteJid } },
+          { key: { path: ['remoteJid'], equals: targetRemoteJid } },
         ],
       },
     });
@@ -1982,21 +2019,32 @@ export class ChatwootService {
       this.logger.warn('[reaction] target mapping unavailable; no timeline message created');
       return;
     }
-    const timestamp = reaction.senderTimestampMs != null
-      ? Long.fromValue(reaction.senderTimestampMs).toNumber()
-      : Long.fromValue(body.messageTimestamp).toNumber() * 1000;
+    const timestamp =
+      reaction.senderTimestampMs != null
+        ? Long.fromValue(reaction.senderTimestampMs).toNumber()
+        : Long.fromValue(body.messageTimestamp).toNumber() * 1000;
     await axios.post(
       `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${target.chatwootConversationId}/reaction_events`,
-      { reaction: {
-        target_id: reaction.key.id, group_jid: body.key.remoteJid,
-        event_id: body.key.id, from_me: body.key.fromMe,
-        participant: body.key.participant || '', name: body.pushName,
-        emoji: reaction.text || '', timestamp_ms: timestamp,
-      } },
-      { headers: {
-        api_access_token: provider.token,
-        'X-Evolution-Reaction-Key': this.configService.get<any>('AUTHENTICATION').API_KEY.KEY,
-      }, timeout: 25000 },
+      {
+        reaction: {
+          target_id: reaction.key.id,
+          ...(targetRemoteJid.endsWith('@g.us') ? { group_jid: targetRemoteJid } : {}),
+          event_id: body.key.id,
+          from_me: body.key.fromMe,
+          participant:
+            body.key.participant || body.key.participantAlt || body.key.remoteJidAlt || body.key.remoteJid || '',
+          name: body.pushName,
+          emoji: reaction.text || '',
+          timestamp_ms: timestamp,
+        },
+      },
+      {
+        headers: {
+          api_access_token: provider.token,
+          'X-Evolution-Reaction-Key': this.configService.get<any>('AUTHENTICATION').API_KEY.KEY,
+        },
+        timeout: 25000,
+      },
     );
   }
 
@@ -2059,7 +2107,7 @@ export class ChatwootService {
         }
 
         if (body.message?.reactionMessage) {
-          await this.forwardGroupReaction(instance, body);
+          await this.forwardReaction(instance, body);
           return;
         }
 
