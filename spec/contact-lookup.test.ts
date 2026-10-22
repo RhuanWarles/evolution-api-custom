@@ -5,6 +5,8 @@ import {
   contactIdentifierCandidates,
   contactPhoneCandidatesFromContext,
   findContactByIdentifiers,
+  normalizeChatwootContact,
+  normalizeChatwootContacts,
   normalizeWhatsAppPhone,
   selectPreferredPhoneContact,
 } from '../src/api/integrations/chatbot/chatwoot/utils/contact-lookup';
@@ -105,4 +107,29 @@ test('does not select a partial or unrelated phone result', () => {
   );
 
   assert.equal(selected, null);
+});
+
+test('normalizes direct and wrapped Chatwoot contact responses', () => {
+  const contact = { id: 265, identifier: '556298613444@s.whatsapp.net' };
+
+  assert.equal(normalizeChatwootContact({ id: 265 })?.id, 265);
+  assert.equal(normalizeChatwootContact({ payload: contact })?.id, 265);
+  assert.equal(normalizeChatwootContact({ payload: { contact } })?.id, 265);
+  assert.equal(normalizeChatwootContact({ contact })?.id, 265);
+  assert.equal(normalizeChatwootContact({ payload: { message: 'updated' } }), null);
+});
+
+test('normalizes contact lists from SDK and wrapped responses', () => {
+  assert.deepEqual(
+    normalizeChatwootContacts([{ id: 265 }]).map((contact) => contact.id),
+    [265],
+  );
+  assert.deepEqual(
+    normalizeChatwootContacts({ payload: [{ id: 265 }] }).map((contact) => contact.id),
+    [265],
+  );
+  assert.deepEqual(
+    normalizeChatwootContacts({ payload: [{ id: 265 }, { message: 'invalid' }] }).map((contact) => contact.id),
+    [265],
+  );
 });

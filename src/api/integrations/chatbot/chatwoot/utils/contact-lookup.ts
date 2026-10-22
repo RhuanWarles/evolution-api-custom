@@ -4,6 +4,8 @@ type ContactRecord = {
   [key: string]: unknown;
 };
 
+type UnknownRecord = Record<string, any>;
+
 type ContactsApi = {
   search: (params: { accountId: number; q: string; sort: 'name' }) => Promise<any>;
   filter: (params: {
@@ -27,10 +29,33 @@ export type ContactIdentityContext = {
   phoneNumber?: string | null;
 };
 
-const contactRecords = (result: ContactRecord[] | { payload?: ContactRecord[] } | undefined) => {
-  if (Array.isArray(result)) return result;
-  return Array.isArray(result?.payload) ? result.payload : [];
-};
+export function normalizeChatwootContact(response: unknown): ContactRecord | null {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) return null;
+
+  const value = response as UnknownRecord;
+  const candidates = [value, value.payload, value.payload?.contact, value.contact];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+
+    const id = Number((candidate as UnknownRecord).id);
+    if (Number.isInteger(id) && id > 0) {
+      return { ...(candidate as ContactRecord), id };
+    }
+  }
+
+  return null;
+}
+
+export function normalizeChatwootContacts(response: unknown): ContactRecord[] {
+  const values = Array.isArray(response)
+    ? response
+    : response && typeof response === 'object' && Array.isArray((response as UnknownRecord).payload)
+      ? (response as UnknownRecord).payload
+      : [];
+
+  return values.map(normalizeChatwootContact).filter((contact): contact is ContactRecord => Boolean(contact));
+}
 
 export async function findExactContactByIdentifier(
   contactsApi: ContactsApi,
@@ -40,7 +65,7 @@ export async function findExactContactByIdentifier(
 ) {
   try {
     const searchResult = await contactsApi.search({ accountId, q: identifier, sort: 'name' });
-    const exactContact = (searchResult?.payload || []).find((contact) => contact.identifier === identifier);
+    const exactContact = normalizeChatwootContacts(searchResult).find((contact) => contact.identifier === identifier);
     if (exactContact) return exactContact;
   } catch (error) {
     logger.warn(
@@ -60,7 +85,7 @@ export async function findExactContactByIdentifier(
         },
       ],
     });
-    return contactRecords(filterResult).find((contact) => contact.identifier === identifier) || null;
+    return normalizeChatwootContacts(filterResult).find((contact) => contact.identifier === identifier) || null;
   } catch (error) {
     logger.warn(
       `Contact identifier filter failed for ${identifier}: ${error instanceof Error ? error.message : 'unknown error'}`,

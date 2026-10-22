@@ -9,6 +9,8 @@ import {
   contactPhoneCandidatesFromContext,
   findContactByIdentifiers,
   findExactContactByIdentifier,
+  normalizeChatwootContact,
+  normalizeChatwootContacts,
   normalizeWhatsAppPhoneWithPlus,
   selectPreferredPhoneContact,
 } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
@@ -337,10 +339,11 @@ export class ChatwootService {
         };
       }
 
-      const contact = await client.contacts.create({
+      const contactResponse = await client.contacts.create({
         accountId: this.provider.accountId,
         data,
       });
+      const contact = normalizeChatwootContact(contactResponse);
 
       if (!contact) {
         this.logger.warn('contact not found');
@@ -391,13 +394,13 @@ export class ChatwootService {
     }
 
     try {
-      const contact = await client.contacts.update({
+      const contactResponse = await client.contacts.update({
         accountId: this.provider.accountId,
         id,
         data,
       });
 
-      return contact;
+      return normalizeChatwootContact(contactResponse);
     } catch {
       return null;
     }
@@ -497,7 +500,7 @@ export class ChatwootService {
       body: { payload: this.getFilterPayload(normalizeWhatsAppPhoneWithPlus(phoneNumber) || phoneNumber) },
     })) as any;
 
-    return Array.isArray(contact?.payload) ? contact.payload : [];
+    return normalizeChatwootContacts(contact);
   }
 
   public async findContact(instance: InstanceDto, phoneNumber: string) {
@@ -534,16 +537,15 @@ export class ChatwootService {
       });
     }
 
-    if (!contact && contact?.payload?.length === 0) {
+    const contacts = normalizeChatwootContacts(contact);
+    if (contacts.length === 0) {
       this.logger.warn('contact not found');
       return null;
     }
 
-    if (!isGroup) {
-      return contact.payload.length > 1 ? this.findContactInContactList(contact.payload, query) : contact.payload[0];
-    } else {
-      return contact.payload.find((contact) => contact.identifier === query);
-    }
+    if (!isGroup) return contacts.length > 1 ? this.findContactInContactList(contacts, query) : contacts[0];
+
+    return contacts.find((contact) => contact.identifier === query) || null;
   }
 
   private async mergeContacts(baseId: number, mergeId: number) {
@@ -845,11 +847,18 @@ export class ChatwootService {
           return null;
         }
 
-        const contactId = contact?.payload?.id || contact?.payload?.contact?.id || contact?.id;
+        contact = normalizeChatwootContact(contact);
+        if (!contact?.id) {
+          this.logger.error(`Contact lookup returned no valid ID for ${identityKey}`);
+          return null;
+        }
+
+        const contactId = contact.id;
         this.logger.verbose(`Contact ID: ${contactId}`);
 
         const contactCandidates = [contact, resolvedContact.fallback]
-          .filter(Boolean)
+          .map(normalizeChatwootContact)
+          .filter((candidate): candidate is { id: number } => Boolean(candidate?.id))
           .filter((candidate, index, candidates) => candidates.findIndex((item) => item.id === candidate.id) === index);
         let contactConversations: any[] = [];
         for (const candidate of contactCandidates) {
