@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { normalizeWhatsAppPhoneWithPlus } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -106,64 +107,112 @@ class ChatwootImport {
           labelId = (await pgClient.query(sqlLabel))?.rows[0]?.id;
         }
 
-        // inserting contacts in chatwoot db
-        let sqlInsert = `INSERT INTO contacts
-          (name, phone_number, account_id, identifier, created_at, updated_at) VALUES `;
-        const bindInsert = [provider.accountId];
+        const contactIds: number[] = [];
+        await pgClient.query('BEGIN');
+        try {
+          for (const contact of contactsChunk) {
+            const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
+            const phoneNumber = isGroup ? null : normalizeWhatsAppPhoneWithPlus(contact.remoteJid);
+            const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
 
-        for (const contact of contactsChunk) {
-          const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
+            await pgClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+              `${provider.accountId}:${phoneNumber || contact.remoteJid}`,
+            ]);
 
-          const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
-          bindInsert.push(contactName);
-          const bindName = `$${bindInsert.length}`;
+            const existingResult = await pgClient.query(
+              `SELECT c.id, c.identifier, c.phone_number,
+                      EXISTS (SELECT 1 FROM contact_inboxes ci WHERE ci.contact_id = c.id) AS has_inbox
+                 FROM contacts c
+                WHERE c.account_id = $1
+                  AND (c.identifier = $2 OR ($3::text IS NOT NULL AND c.phone_number = $3))
+                ORDER BY has_inbox DESC, (c.identifier = $2) DESC, c.id ASC
+                LIMIT 1
+                FOR UPDATE`,
+              [provider.accountId, contact.remoteJid, phoneNumber],
+            );
 
-          let bindPhoneNumber: string;
-          if (!isGroup) {
-            bindInsert.push(`+${contact.remoteJid.split('@')[0]}`);
-            bindPhoneNumber = `$${bindInsert.length}`;
-          } else {
-            bindPhoneNumber = 'NULL';
+            let contactId = existingResult.rows[0]?.id;
+            if (contactId) {
+              const identifierConflict = await pgClient.query(
+                `SELECT 1 FROM contacts
+                  WHERE account_id = $1 AND identifier = $2 AND id <> $3
+                  LIMIT 1`,
+                [provider.accountId, contact.remoteJid, contactId],
+              );
+
+              await pgClient.query(
+                `UPDATE contacts
+                    SET name = COALESCE($1, name),
+                        phone_number = COALESCE($2, phone_number),
+                        identifier = CASE
+                          WHEN (identifier IS NULL OR identifier = '') AND $4 = false THEN $3
+                          ELSE identifier
+                        END,
+                        updated_at = NOW()
+                  WHERE id = $5`,
+                [contactName, phoneNumber, contact.remoteJid, identifierConflict.rowCount > 0, contactId],
+              );
+            } else {
+              const inserted = await pgClient.query(
+                `INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, NOW(), NOW())
+                 ON CONFLICT (identifier, account_id) DO NOTHING
+                 RETURNING id`,
+                [contactName, phoneNumber, provider.accountId, contact.remoteJid],
+              );
+              contactId = inserted.rows[0]?.id;
+              if (contactId) totalContactsImported += 1;
+            }
+
+            if (!contactId) {
+              const resolved = await pgClient.query(
+                `SELECT id FROM contacts
+                  WHERE account_id = $1
+                    AND (identifier = $2 OR ($3::text IS NOT NULL AND phone_number = $3))
+                  ORDER BY id ASC
+                  LIMIT 1`,
+                [provider.accountId, contact.remoteJid, phoneNumber],
+              );
+              contactId = resolved.rows[0]?.id;
+            }
+
+            if (contactId) contactIds.push(Number(contactId));
           }
-          bindInsert.push(contact.remoteJid);
-          const bindIdentifier = `$${bindInsert.length}`;
-
-          sqlInsert += `(${bindName}, ${bindPhoneNumber}, $1, ${bindIdentifier}, NOW(), NOW()),`;
-        }
-        if (sqlInsert.slice(-1) === ',') {
-          sqlInsert = sqlInsert.slice(0, -1);
-        }
-        sqlInsert += ` ON CONFLICT (identifier, account_id)
-                       DO UPDATE SET
-                        name = EXCLUDED.name,
-                        phone_number = EXCLUDED.phone_number,
-                        updated_at = NOW()`;
-
-        totalContactsImported += (await pgClient.query(sqlInsert, bindInsert))?.rowCount ?? 0;
-
-        const sqlTags = `SELECT id FROM tags WHERE name = '${provider.nameInbox}' LIMIT 1`;
-
-        const tagData = (await pgClient.query(sqlTags))?.rows[0];
-        let tagId = tagData?.id;
-
-        const sqlTag = `INSERT INTO tags (name, taggings_count) VALUES ('${provider.nameInbox}', ${totalContactsImported}) ON CONFLICT (name) DO UPDATE SET taggings_count = tags.taggings_count + ${totalContactsImported} RETURNING id`;
-
-        tagId = (await pgClient.query(sqlTag))?.rows[0]?.id;
-
-        await pgClient.query(sqlTag);
-
-        let sqlInsertLabel = `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at) VALUES `;
-
-        contactsChunk.forEach((contact) => {
-          const bindTaggableId = `(SELECT id FROM contacts WHERE identifier = '${contact.remoteJid}' AND account_id = ${provider.accountId})`;
-          sqlInsertLabel += `($1, $2, ${bindTaggableId}, $3, NOW()),`;
-        });
-
-        if (sqlInsertLabel.slice(-1) === ',') {
-          sqlInsertLabel = sqlInsertLabel.slice(0, -1);
+          await pgClient.query('COMMIT');
+        } catch (error) {
+          await pgClient.query('ROLLBACK');
+          throw error;
         }
 
-        await pgClient.query(sqlInsertLabel, [tagId, 'Contact', 'labels']);
+        if (contactIds.length > 0) {
+          const tag = await pgClient.query(
+            `INSERT INTO tags (name, taggings_count)
+             VALUES ($1, 0)
+             ON CONFLICT (name) DO UPDATE SET taggings_count = tags.taggings_count
+             RETURNING id`,
+            [provider.nameInbox],
+          );
+          const tagId = tag.rows[0]?.id;
+
+          for (const contactId of [...new Set(contactIds)]) {
+            await pgClient.query(
+              `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at)
+               SELECT $1, 'Contact', $2, 'labels', NOW()
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM taggings
+                   WHERE tag_id = $1 AND taggable_type = 'Contact' AND taggable_id = $2 AND context = 'labels'
+                )`,
+              [tagId, contactId],
+            );
+          }
+
+          await pgClient.query(
+            `UPDATE tags SET taggings_count = (
+               SELECT COUNT(*) FROM taggings WHERE tag_id = $1 AND context = 'labels'
+             ) WHERE id = $1`,
+            [tagId],
+          );
+        }
 
         contactsChunk = this.sliceIntoChunks(contacts, 3000);
       }
@@ -354,89 +403,125 @@ class ChatwootImport {
     messagesByPhoneNumber: Map<string, Message[]>,
   ): Promise<Map<string, FksChatwoot>> {
     const pgClient = postgresClient.getChatwootConnection();
+    const resolved = new Map<string, FksChatwoot>();
 
-    const bindValues = [provider.accountId, inbox.id];
-    const phoneNumberBind = Array.from(messagesByPhoneNumber.keys())
-      .map((phoneNumber) => {
-        const phoneNumberTimestamp = phoneNumbersWithTimestamp.get(phoneNumber);
+    await pgClient.query('BEGIN');
+    try {
+      for (const phoneNumber of messagesByPhoneNumber.keys()) {
+        const timestamp = phoneNumbersWithTimestamp.get(phoneNumber);
+        if (!timestamp) continue;
 
-        if (phoneNumberTimestamp) {
-          bindValues.push(phoneNumber);
-          let bindStr = `($${bindValues.length},`;
+        const identifier = `${phoneNumber.replace('+', '')}@s.whatsapp.net`;
+        await pgClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          `${provider.accountId}:${phoneNumber}`,
+        ]);
 
-          bindValues.push(phoneNumberTimestamp.first);
-          bindStr += `$${bindValues.length},`;
+        let contactResult = await pgClient.query(
+          `SELECT id, identifier, phone_number
+             FROM contacts
+            WHERE account_id = $1 AND phone_number = $2
+            ORDER BY id ASC
+            LIMIT 1
+            FOR UPDATE`,
+          [provider.accountId, phoneNumber],
+        );
 
-          bindValues.push(phoneNumberTimestamp.last);
-          return `${bindStr}$${bindValues.length})`;
+        let contactId = contactResult.rows[0]?.id;
+        if (!contactId) {
+          const inserted = await pgClient.query(
+            `INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, to_timestamp($5), to_timestamp($6))
+             ON CONFLICT (identifier, account_id) DO NOTHING
+             RETURNING id`,
+            [
+              phoneNumber.replace('+', ''),
+              phoneNumber,
+              provider.accountId,
+              identifier,
+              timestamp.first,
+              timestamp.last,
+            ],
+          );
+          contactId = inserted.rows[0]?.id;
         }
-      })
-      .join(',');
 
-    // select (or insert when necessary) data from tables contacts, contact_inboxes, conversations from chatwoot db
-    const sqlFromChatwoot = `WITH
-              phone_number AS (
-                SELECT phone_number, created_at::INTEGER, last_activity_at::INTEGER FROM (
-                  VALUES 
-                   ${phoneNumberBind}
-                 ) as t (phone_number, created_at, last_activity_at)
-              ),
+        if (contactId && contactResult.rows[0]?.identifier !== identifier) {
+          const identifierConflict = await pgClient.query(
+            `SELECT 1 FROM contacts WHERE account_id = $1 AND identifier = $2 AND id <> $3 LIMIT 1`,
+            [provider.accountId, identifier, contactId],
+          );
+          if (identifierConflict.rowCount === 0) {
+            await pgClient.query(
+              `UPDATE contacts SET identifier = $1, updated_at = NOW() WHERE id = $2 AND (identifier IS NULL OR identifier = '')`,
+              [identifier, contactId],
+            );
+          }
+        }
 
-              only_new_phone_number AS (
-                SELECT * FROM phone_number
-                WHERE phone_number NOT IN (
-                  SELECT phone_number
-                  FROM contacts
-                    JOIN contact_inboxes ci ON ci.contact_id = contacts.id AND ci.inbox_id = $2
-                    JOIN conversations con ON con.contact_inbox_id = ci.id 
-                      AND con.account_id = $1
-                      AND con.inbox_id = $2
-                      AND con.contact_id = contacts.id
-                  WHERE contacts.account_id = $1
-                )
-              ),
+        if (!contactId) {
+          contactResult = await pgClient.query(
+            `SELECT id FROM contacts
+              WHERE account_id = $1 AND (phone_number = $2 OR identifier = $3)
+              ORDER BY id ASC
+              LIMIT 1
+              FOR UPDATE`,
+            [provider.accountId, phoneNumber, identifier],
+          );
+          contactId = contactResult.rows[0]?.id;
+        }
 
-              new_contact AS (
-                INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
-                SELECT REPLACE(p.phone_number, '+', ''), p.phone_number, $1, CONCAT(REPLACE(p.phone_number, '+', ''),
-                  '@s.whatsapp.net'), to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
-                FROM only_new_phone_number AS p
-                ON CONFLICT(identifier, account_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
-                RETURNING id, phone_number, created_at, updated_at
-              ),
+        if (!contactId) continue;
 
-              new_contact_inbox AS (
-                INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
-                SELECT new_contact.id, $2, gen_random_uuid(), new_contact.created_at, new_contact.updated_at
-                FROM new_contact 
-                RETURNING id, contact_id, created_at, updated_at
-              ),
+        const contactInboxResult = await pgClient.query(
+          `SELECT id FROM contact_inboxes WHERE contact_id = $1 AND inbox_id = $2 LIMIT 1 FOR UPDATE`,
+          [contactId, inbox.id],
+        );
+        let contactInboxId = contactInboxResult.rows[0]?.id;
+        if (!contactInboxId) {
+          const insertedContactInbox = await pgClient.query(
+            `INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
+             VALUES ($1, $2, gen_random_uuid(), NOW(), NOW())
+             RETURNING id`,
+            [contactId, inbox.id],
+          );
+          contactInboxId = insertedContactInbox.rows[0]?.id;
+        }
 
-              new_conversation AS (
-                INSERT INTO conversations (account_id, inbox_id, status, contact_id,
-                  contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
-                SELECT $1, $2, 0, new_contact_inbox.contact_id, new_contact_inbox.id, gen_random_uuid(),
-                  new_contact_inbox.updated_at, new_contact_inbox.created_at, new_contact_inbox.updated_at
-                FROM new_contact_inbox
-                RETURNING id, contact_id
-              )
+        const conversationResult = await pgClient.query(
+          `SELECT id FROM conversations
+            WHERE account_id = $1 AND inbox_id = $2 AND contact_id = $3 AND contact_inbox_id = $4
+            ORDER BY id ASC
+            LIMIT 1
+            FOR UPDATE`,
+          [provider.accountId, inbox.id, contactId, contactInboxId],
+        );
+        let conversationId = conversationResult.rows[0]?.id;
+        if (!conversationId) {
+          const insertedConversation = await pgClient.query(
+            `INSERT INTO conversations
+              (account_id, inbox_id, status, contact_id, contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
+             VALUES ($1, $2, 0, $3, $4, gen_random_uuid(), to_timestamp($5), to_timestamp($5), to_timestamp($5))
+             RETURNING id`,
+            [provider.accountId, inbox.id, contactId, contactInboxId, timestamp.first],
+          );
+          conversationId = insertedConversation.rows[0]?.id;
+        }
 
-              SELECT new_contact.phone_number, new_conversation.contact_id, new_conversation.id AS conversation_id
-              FROM new_conversation 
-              JOIN new_contact ON new_conversation.contact_id = new_contact.id
+        if (contactInboxId && conversationId) {
+          resolved.set(phoneNumber, {
+            phone_number: phoneNumber,
+            contact_id: String(contactId),
+            conversation_id: String(conversationId),
+          });
+        }
+      }
+      await pgClient.query('COMMIT');
+    } catch (error) {
+      await pgClient.query('ROLLBACK');
+      throw error;
+    }
 
-              UNION
-
-              SELECT p.phone_number, c.id contact_id, con.id conversation_id
-                FROM phone_number p
-              JOIN contacts c ON c.phone_number = p.phone_number
-              JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
-              JOIN conversations con ON con.contact_inbox_id = ci.id AND con.account_id = $1
-                AND con.inbox_id = $2 AND con.contact_id = c.id`;
-
-    const fksFromChatwoot = await pgClient.query(sqlFromChatwoot, bindValues);
-
-    return new Map(fksFromChatwoot.rows.map((item: FksChatwoot) => [item.phone_number, item]));
+    return resolved;
   }
 
   public async getChatwootUser(provider: ChatwootModel): Promise<ChatwootUser> {
@@ -459,9 +544,8 @@ class ChatwootImport {
         remoteJid: string;
       };
       if (!this.isIgnorePhoneNumber(key?.remoteJid)) {
-        const phoneNumber = key?.remoteJid?.split('@')[0];
-        if (phoneNumber) {
-          const phoneNumberPlus = `+${phoneNumber}`;
+        const phoneNumberPlus = normalizeWhatsAppPhoneWithPlus((key as any)?.remoteJidAlt || key?.remoteJid);
+        if (phoneNumberPlus) {
           const messages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
           messages.push(message);
           acc.set(phoneNumberPlus, messages);

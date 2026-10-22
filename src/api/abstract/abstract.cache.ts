@@ -5,6 +5,8 @@ export interface ICache {
 
   set(key: string, value: any, ttl?: number): void;
 
+  setIfNotExists(key: string, value: any, ttl?: number): Promise<boolean>;
+
   hSet(key: string, field: string, value: any): Promise<void>;
 
   has(key: string): Promise<boolean>;

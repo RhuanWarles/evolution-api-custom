@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  contactIdentityKey,
   contactIdentifierCandidates,
+  contactPhoneCandidatesFromContext,
   findContactByIdentifiers,
+  normalizeWhatsAppPhone,
+  selectPreferredPhoneContact,
 } from '../src/api/integrations/chatbot/chatwoot/utils/contact-lookup';
 
 const logger = { warn: () => undefined };
@@ -55,4 +59,50 @@ test('returns no identifier contact so phone fallback can continue', async () =>
 
   assert.equal(result.contact, null);
   assert.equal(result.identifier, null);
+});
+
+test('correlates LID, remoteJidAlt and normalized phone before contact creation', () => {
+  const body = {
+    key: {
+      remoteJid: '281449391493336@lid',
+      remoteJidAlt: '556294665004@s.whatsapp.net',
+    },
+  };
+
+  assert.deepEqual(contactPhoneCandidatesFromContext({ ...body.key }), ['+556294665004']);
+  assert.equal(contactIdentityKey({ ...body.key }), 'phone:556294665004');
+  assert.equal(normalizeWhatsAppPhone('+55 (62) 94665-004'), '556294665004');
+});
+
+test('reuses the phone contact when a duplicate identifier contact already exists', () => {
+  const phoneContact = { id: 30, phone_number: '+556294665004', identifier: null, contact_inboxes: [{ id: 136 }] };
+  const identifierContact = {
+    id: 153,
+    phone_number: '+556294665004',
+    identifier: '556294665004@s.whatsapp.net',
+    contact_inboxes: [],
+  };
+
+  assert.equal(selectPreferredPhoneContact([identifierContact, phoneContact], ['556294665004@s.whatsapp.net'])?.id, 30);
+});
+
+test('selects the oldest deterministic contact when duplicate phone formats have no inbox', () => {
+  const selected = selectPreferredPhoneContact(
+    [
+      { id: 42, phone_number: '+556294665004', contact_inboxes: [] },
+      { id: 41, phone_number: '556294665004', contact_inboxes: [] },
+    ],
+    ['+556294665004'],
+  );
+
+  assert.equal(selected?.id, 41);
+});
+
+test('does not select a partial or unrelated phone result', () => {
+  const selected = selectPreferredPhoneContact(
+    [{ id: 90, phone_number: '+5511999999999', contact_inboxes: [] }],
+    ['+556294665004'],
+  );
+
+  assert.equal(selected, null);
 });

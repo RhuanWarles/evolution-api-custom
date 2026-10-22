@@ -45,6 +45,13 @@ export class CacheService {
     this.cache.set(key, value, ttl);
   }
 
+  async setIfNotExists(key: string, value: any, ttl?: number) {
+    if (!this.cache) {
+      return true;
+    }
+    return this.cache.setIfNotExists(key, value, ttl);
+  }
+
   public async hSet(key: string, field: string, value: any) {
     if (!this.cache) {
       return;

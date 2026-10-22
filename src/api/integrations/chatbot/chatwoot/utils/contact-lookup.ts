@@ -21,6 +21,12 @@ type Logger = {
   warn: (message: string) => void;
 };
 
+export type ContactIdentityContext = {
+  remoteJid?: string | null;
+  remoteJidAlt?: string | null;
+  phoneNumber?: string | null;
+};
+
 const contactRecords = (result: ContactRecord[] | { payload?: ContactRecord[] } | undefined) => {
   if (Array.isArray(result)) return result;
   return Array.isArray(result?.payload) ? result.payload : [];
@@ -64,9 +70,11 @@ export async function findExactContactByIdentifier(
 }
 
 export function contactIdentifierCandidates(body: any, phoneNumber: string) {
-  return [...new Set([body?.key?.remoteJid, body?.key?.remoteJidAlt, phoneNumber])].filter(
-    (identifier): identifier is string => typeof identifier === 'string' && identifier.includes('@'),
-  );
+  return contactIdentifierCandidatesFromContext({
+    remoteJid: body?.key?.remoteJid,
+    remoteJidAlt: body?.key?.remoteJidAlt,
+    phoneNumber,
+  });
 }
 
 export async function findContactByIdentifiers(
@@ -81,4 +89,62 @@ export async function findContactByIdentifiers(
   }
 
   return { contact: null, identifier: null };
+}
+
+export function normalizeWhatsAppPhone(value?: string | null) {
+  if (!value || value.endsWith('@lid') || value.endsWith('@g.us') || value === 'status@broadcast') {
+    return null;
+  }
+
+  const number = value.split('@')[0].split(':')[0].replace(/\D/g, '');
+  return number || null;
+}
+
+export function normalizeWhatsAppPhoneWithPlus(value?: string | null) {
+  const number = normalizeWhatsAppPhone(value);
+  return number ? `+${number}` : null;
+}
+
+export function contactIdentifierCandidatesFromContext(context: ContactIdentityContext) {
+  const candidates = [context.remoteJid, context.remoteJidAlt, context.phoneNumber]
+    .filter((value): value is string => typeof value === 'string' && value.includes('@'))
+    .filter((value) => !value.endsWith('@g.us'));
+
+  const phoneJid = normalizeWhatsAppPhoneWithPlus(context.remoteJidAlt || context.phoneNumber);
+  if (phoneJid) {
+    candidates.push(`${phoneJid.slice(1)}@s.whatsapp.net`);
+  }
+
+  return [...new Set(candidates)];
+}
+
+export function contactPhoneCandidatesFromContext(context: ContactIdentityContext) {
+  return [context.remoteJidAlt, context.remoteJid, context.phoneNumber]
+    .map((value) => normalizeWhatsAppPhoneWithPlus(value))
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index);
+}
+
+export function contactIdentityKey(context: ContactIdentityContext) {
+  const phone = [context.remoteJidAlt, context.phoneNumber, context.remoteJid]
+    .map((value) => normalizeWhatsAppPhone(value))
+    .find(Boolean);
+  if (phone) return `phone:${phone}`;
+
+  const identifier = context.remoteJid || context.remoteJidAlt || context.phoneNumber;
+  return `jid:${identifier || 'unknown'}`;
+}
+
+export function selectPreferredPhoneContact(contacts: ContactRecord[], phoneNumbers: string[]) {
+  const normalizedPhoneNumbers = phoneNumbers.map((phoneNumber) => normalizeWhatsAppPhone(phoneNumber));
+  const matches = contacts.filter((contact) =>
+    normalizedPhoneNumbers.includes(normalizeWhatsAppPhone(String(contact.phone_number))),
+  );
+  if (!matches.length) return null;
+
+  return [...matches].sort((left, right) => {
+    const leftHasInbox = Array.isArray(left.contact_inboxes) && left.contact_inboxes.length > 0 ? 0 : 1;
+    const rightHasInbox = Array.isArray(right.contact_inboxes) && right.contact_inboxes.length > 0 ? 0 : 1;
+    return leftHasInbox - rightHasInbox || Number(left.id || 0) - Number(right.id || 0);
+  })[0];
 }
