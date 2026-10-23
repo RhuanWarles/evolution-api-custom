@@ -15,6 +15,10 @@ import {
   selectPreferredPhoneContact,
 } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
 import { buildGroupContactUpdate } from '@api/integrations/chatbot/chatwoot/utils/group-contact-metadata';
+import {
+  extractEditedMessageText,
+  whatsappMessageKeysMatch,
+} from '@api/integrations/chatbot/chatwoot/utils/message-edit';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -1764,34 +1768,39 @@ export class ChatwootService {
       .filter((contact, index, values) => values.findIndex((item) => item.id === contact.id) === index);
 
     for (const contact of contacts) {
-      const conversations = (await client.contacts.listConversations({
+      const conversationsResponse = await client.contacts.listConversations({
         accountId: this.provider.accountId,
         id: contact.id,
-      })) as any;
+      });
+      const conversations = Array.isArray(conversationsResponse)
+        ? conversationsResponse
+        : (conversationsResponse as any)?.payload || [];
 
       for (const conversation of conversations || []) {
         if (conversation?.inbox_id !== filterInbox.id || !conversation.id) continue;
 
-        const messages = await client.messages.list({
+        const messagesResponse = await client.messages.list({
           accountId: this.provider.accountId,
           conversationId: conversation.id,
         });
+        const messages = Array.isArray(messagesResponse) ? messagesResponse : (messagesResponse as any)?.payload || [];
         const matchingMessage = (messages || []).find((message: any) => {
-          const messageKey = message?.content_attributes?.whatsapp_message_key;
+          const messageKey =
+            message?.content_attributes?.whatsapp_message_key || message?.content_attributes?.whatsappMessageKey;
           const sourceId = String(message?.source_id || '').replace(/^WAID:/, '');
-          const keyMatches =
-            messageKey?.id === key.id &&
-            (!key.remoteJid || !messageKey.remoteJid || messageKey.remoteJid === key.remoteJid) &&
-            (key.fromMe === undefined || messageKey.fromMe === undefined || messageKey.fromMe === key.fromMe);
+          const keyMatches = whatsappMessageKeysMatch(key, messageKey);
 
-          return sourceId === key.id || keyMatches;
+          return sourceId === String(key.id) || keyMatches;
         });
 
         if (matchingMessage?.id) {
+          const storedKey =
+            matchingMessage.content_attributes?.whatsapp_message_key ||
+            matchingMessage.content_attributes?.whatsappMessageKey;
           return {
             chatwootMessageId: Number(matchingMessage.id),
             chatwootConversationId: Number(conversation.id),
-            key,
+            key: storedKey || key,
           };
         }
       }
@@ -2533,15 +2542,11 @@ export class ChatwootService {
       }
 
       if (event === 'messages.edit' || event === 'send.message.update') {
-        const editedMessageContentRaw =
-          body?.editedMessage?.conversation ??
-          body?.editedMessage?.extendedTextMessage?.text ??
-          body?.editedMessage?.imageMessage?.caption ??
-          body?.editedMessage?.videoMessage?.caption ??
-          body?.editedMessage?.documentMessage?.caption ??
-          (typeof body?.text === 'string' ? body.text : undefined);
-
-        const editedMessageContent = (editedMessageContentRaw ?? '').trim();
+        this.logger.info(
+          `[CW.EDIT] Received event=${event} key=${body?.key?.id || 'missing'} ` +
+            `remoteJid=${body?.key?.remoteJid || 'missing'}`,
+        );
+        const editedMessageContent = extractEditedMessageText(body);
 
         if (!editedMessageContent) {
           this.logger.info('[CW.EDIT] Conteúdo vazio — ignorando (DELETE tratará se for revoke).');
@@ -2569,22 +2574,38 @@ export class ChatwootService {
         }
 
         const key = chatwootMessage.key as WAMessageKey;
+        const fromMe = key.fromMe ?? (key as any).from_me;
 
         if (chatwootMessage.chatwootConversationId && chatwootMessage.chatwootMessageId) {
-          await client.messages.update({
-            accountId: this.provider.accountId,
-            conversationId: chatwootMessage.chatwootConversationId,
-            messageId: chatwootMessage.chatwootMessageId,
-            data: {
-              content: editedMessageContent,
-              content_attributes: {
-                whatsapp_message_key: key,
-                whatsapp_message_edited: true,
-                whatsapp_message_edit_source: key.fromMe ? 'whatsapp_outgoing' : 'whatsapp_incoming',
-                whatsapp_message_edited_at: new Date().toISOString(),
+          const contentAttributes = {
+            whatsapp_message_key: key,
+            whatsapp_message_edited: true,
+            whatsapp_message_edit_source: fromMe ? 'whatsapp_outgoing' : 'whatsapp_incoming',
+            whatsapp_message_edited_at: new Date().toISOString(),
+          };
+
+          this.logger.info(
+            `[CW.EDIT] Updating Chatwoot message=${chatwootMessage.chatwootMessageId} ` +
+              `conversation=${chatwootMessage.chatwootConversationId} key=${key.id}`,
+          );
+
+          try {
+            // The SDK update endpoint uses multipart/form-data. Rails expects
+            // content_attributes as a JSON object for this internal update.
+            await chatwootRequest(this.getClientCwConfig(), {
+              method: 'PATCH',
+              url: `/api/v1/accounts/${this.provider.accountId}/conversations/${chatwootMessage.chatwootConversationId}/messages/${chatwootMessage.chatwootMessageId}`,
+              body: {
+                content: editedMessageContent,
+                content_attributes: contentAttributes,
               },
-            },
-          });
+            });
+          } catch (error) {
+            this.logger.error(
+              `[CW.EDIT] Chatwoot update failed for key=${key.id}: ${error instanceof Error ? error.message : 'unknown error'}`,
+            );
+            throw error;
+          }
         }
         return;
       }
