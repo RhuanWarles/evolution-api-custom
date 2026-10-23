@@ -1747,6 +1747,59 @@ export class ChatwootService {
     return (messages as MessageModel[])[0] || null;
   }
 
+  private async findChatwootMessageByKey(instance: InstanceDto, key: WAMessageKey) {
+    const client = await this.clientCw(instance);
+    if (!client || !key?.id) return null;
+
+    const filterInbox = await this.getInbox(instance);
+    if (!filterInbox) return null;
+
+    const phoneNumber = key.remoteJidAlt || key.remoteJid || '';
+    const resolvedContact = key.remoteJid?.endsWith('@g.us')
+      ? { contact: await this.findContact(instance, key.remoteJid), fallback: null }
+      : await this.findContactForMessage(instance, { key }, phoneNumber);
+    const contacts = [resolvedContact.contact, resolvedContact.fallback]
+      .map(normalizeChatwootContact)
+      .filter((contact): contact is { id: number } => Boolean(contact?.id))
+      .filter((contact, index, values) => values.findIndex((item) => item.id === contact.id) === index);
+
+    for (const contact of contacts) {
+      const conversations = (await client.contacts.listConversations({
+        accountId: this.provider.accountId,
+        id: contact.id,
+      })) as any;
+
+      for (const conversation of conversations || []) {
+        if (conversation?.inbox_id !== filterInbox.id || !conversation.id) continue;
+
+        const messages = await client.messages.list({
+          accountId: this.provider.accountId,
+          conversationId: conversation.id,
+        });
+        const matchingMessage = (messages || []).find((message: any) => {
+          const messageKey = message?.content_attributes?.whatsapp_message_key;
+          const sourceId = String(message?.source_id || '').replace(/^WAID:/, '');
+          const keyMatches =
+            messageKey?.id === key.id &&
+            (!key.remoteJid || !messageKey.remoteJid || messageKey.remoteJid === key.remoteJid) &&
+            (key.fromMe === undefined || messageKey.fromMe === undefined || messageKey.fromMe === key.fromMe);
+
+          return sourceId === key.id || keyMatches;
+        });
+
+        if (matchingMessage?.id) {
+          return {
+            chatwootMessageId: Number(matchingMessage.id),
+            chatwootConversationId: Number(conversation.id),
+            key,
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
   private async getReplyToIds(
     msg: any,
     instance: InstanceDto,
@@ -2501,19 +2554,27 @@ export class ChatwootService {
         }
 
         const message = await this.getMessageByKeyId(instance, body?.key?.id);
+        const chatwootMessage =
+          message?.chatwootConversationId && message?.chatwootMessageId
+            ? {
+                chatwootMessageId: message.chatwootMessageId,
+                chatwootConversationId: message.chatwootConversationId,
+                key: message.key as WAMessageKey,
+              }
+            : await this.findChatwootMessageByKey(instance, body.key as WAMessageKey);
 
-        if (!message) {
-          this.logger.warn('Message not found for edit event');
+        if (!chatwootMessage) {
+          this.logger.warn(`Message not found for edit event. Key: ${body.key.id}`);
           return;
         }
 
-        const key = message.key as WAMessageKey;
+        const key = chatwootMessage.key as WAMessageKey;
 
-        if (message.chatwootConversationId && message.chatwootMessageId) {
+        if (chatwootMessage.chatwootConversationId && chatwootMessage.chatwootMessageId) {
           await client.messages.update({
             accountId: this.provider.accountId,
-            conversationId: message.chatwootConversationId,
-            messageId: message.chatwootMessageId,
+            conversationId: chatwootMessage.chatwootConversationId,
+            messageId: chatwootMessage.chatwootMessageId,
             data: {
               content: editedMessageContent,
               content_attributes: {

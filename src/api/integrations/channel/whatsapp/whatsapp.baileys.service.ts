@@ -1187,6 +1187,23 @@ export class BaileysStartupService extends ChannelStartupService {
                 editedMessage.editedMessage,
                 editedMessageTimestamp,
               );
+            } else {
+              const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
+                ? Math.floor(received?.messageTimestamp.toNumber())
+                : Number(received?.messageTimestamp) || Math.floor(Date.now() / 1000);
+              const payload = {
+                key: editedMessage.key,
+                editedMessage: editedMessage.editedMessage,
+                messageTimestamp: editedMessageTimestamp,
+              };
+              this.sendDataWebhook(Events.MESSAGES_EDITED, payload);
+              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                await this.chatwootService.eventWhatsapp(
+                  'messages.edit',
+                  { instanceName: this.instance.name, instanceId: this.instanceId },
+                  payload,
+                );
+              }
             }
           }
 
@@ -1651,6 +1668,47 @@ export class BaileysStartupService extends ChannelStartupService {
             message.message = update.message;
           }
 
+          const editedMessage = update.message?.editedMessage?.message;
+          if (editedMessage) {
+            const editedMessageTimestamp = Long.isLong(update.messageTimestamp)
+              ? Math.floor(update.messageTimestamp.toNumber())
+              : update.messageTimestamp;
+            const payload = {
+              key,
+              editedMessage,
+              messageTimestamp: editedMessageTimestamp,
+            };
+            const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
+            let originalMessage: any = null;
+
+            if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
+              const protocolMapKey = `protocol_${key.id}`;
+              const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
+              const searchId = originalMessageId || key.id;
+              const messages = (await this.prismaRepository.$queryRaw`
+                SELECT * FROM "Message"
+                WHERE "instanceId" = ${this.instanceId}
+                AND "key"->>'id' = ${searchId}
+                LIMIT 1
+              `) as any[];
+              originalMessage = messages[0] || null;
+            }
+
+            if (originalMessage?.id) {
+              await this.persistEditedMessage(originalMessage, key, editedMessage, editedMessageTimestamp);
+            } else {
+              this.sendDataWebhook(Events.MESSAGES_EDITED, payload);
+              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                await this.chatwootService.eventWhatsapp(
+                  'messages.edit',
+                  { instanceName: this.instance.name, instanceId: this.instanceId },
+                  payload,
+                );
+              }
+            }
+            continue;
+          }
+
           let findMessage: any;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
@@ -1677,15 +1735,6 @@ export class BaileysStartupService extends ChannelStartupService {
               continue;
             }
             message.messageId = findMessage.id;
-          }
-
-          const editedMessage = update.message?.editedMessage?.message;
-          if (editedMessage && findMessage?.id) {
-            const editedMessageTimestamp = Long.isLong(update.messageTimestamp)
-              ? Math.floor(update.messageTimestamp.toNumber())
-              : update.messageTimestamp;
-            await this.persistEditedMessage(findMessage, key, editedMessage, editedMessageTimestamp);
-            continue;
           }
 
           if (update.message === null && update.status === undefined) {
