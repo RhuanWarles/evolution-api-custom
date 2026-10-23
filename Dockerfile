@@ -52,6 +52,9 @@ COPY --from=builder /evolution/Docker ./Docker
 COPY --from=builder /evolution/runWithProvider.js ./runWithProvider.js
 COPY --from=builder /evolution/tsup.config.ts ./tsup.config.ts
 
+# Runtime configuration must come from the container environment, never from image files.
+RUN find /evolution -type f \( -name '.env' -o -name '*.env' -o -name '.env.*' \) -delete
+
 ENV DOCKER_ENV=true
 
 EXPOSE 8080
