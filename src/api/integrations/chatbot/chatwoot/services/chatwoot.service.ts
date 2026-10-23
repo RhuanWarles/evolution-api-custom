@@ -19,6 +19,7 @@ import {
   extractEditedMessageText,
   whatsappMessageKeysMatch,
 } from '@api/integrations/chatbot/chatwoot/utils/message-edit';
+import { buildChatwootMessageIdentity } from '@api/integrations/chatbot/chatwoot/utils/message-identity';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -1705,36 +1706,48 @@ export class ChatwootService {
       return;
     }
 
-    // Use raw SQL to avoid JSON path issues
-    const result = await this.prismaRepository.$executeRaw`
-      UPDATE "Message" 
-      SET 
-        "chatwootMessageId" = ${chatwootMessageIds.messageId},
-        "chatwootConversationId" = ${chatwootMessageIds.conversationId},
-        "chatwootInboxId" = ${chatwootMessageIds.inboxId},
-        "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
-        "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
-      WHERE "instanceId" = ${instance.instanceId} 
-      AND "key"->>'id' = ${key.id}
-    `;
+    const identity = buildChatwootMessageIdentity(key);
+    if (!identity) return;
 
-    this.logger.verbose(`Update result: ${result} rows affected`);
+    // Use raw SQL to avoid JSON path issues
+    try {
+      const result = await this.prismaRepository.$executeRaw`
+        UPDATE "Message"
+        SET
+          "chatwootMessageId" = ${chatwootMessageIds.messageId},
+          "chatwootConversationId" = ${chatwootMessageIds.conversationId},
+          "chatwootInboxId" = ${chatwootMessageIds.inboxId},
+          "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
+          "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
+        WHERE "instanceId" = ${instance.instanceId}
+        AND "key"->>'id' = ${key.id}
+      `;
+
+      this.logger.verbose(`Update result: ${result} rows affected`);
+    } catch (error) {
+      this.logger.error(`Error updating Evolution message mapping: ${error}`);
+    }
+
+    try {
+      // The Chatwoot API is the source of truth when direct DB import is disabled.
+      await chatwootRequest(this.getClientCwConfig(), {
+        method: 'PATCH',
+        url: `/api/v1/accounts/${this.provider.accountId}/conversations/${chatwootMessageIds.conversationId}/messages/${chatwootMessageIds.messageId}`,
+        body: {
+          status: 'sent',
+          external_error: null,
+          content_attributes: identity.contentAttributes,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error updating Chatwoot message identity: ${error}`);
+    }
 
     if (this.isImportHistoryAvailable()) {
       try {
         await chatwootImport.updateMessageSourceID(chatwootMessageIds.messageId, key.id);
-        // Confirm through Rails so status/error changes reach the conversation websocket.
-        await chatwootRequest(this.getClientCwConfig(), {
-          method: 'PATCH',
-          url: `/api/v1/accounts/${this.provider.accountId}/conversations/${chatwootMessageIds.conversationId}/messages/${chatwootMessageIds.messageId}`,
-          body: {
-            status: 'sent',
-            external_error: null,
-            content_attributes: { whatsapp_message_key: key },
-          },
-        });
       } catch (error) {
-        this.logger.error(`Error updating Chatwoot message source ID: ${error}`);
+        this.logger.error(`Error updating Chatwoot import source ID: ${error}`);
       }
     }
   }
