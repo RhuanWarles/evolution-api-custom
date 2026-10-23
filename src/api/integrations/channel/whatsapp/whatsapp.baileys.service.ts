@@ -553,6 +553,54 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private async persistEditedMessage(
+    originalMessage: any,
+    eventKey: WAMessageKey,
+    editedMessage: any,
+    messageTimestamp?: number,
+  ) {
+    const originalKey = (originalMessage?.key || eventKey) as WAMessageKey;
+    const editedMessageTimestamp = Number(messageTimestamp) || Math.floor(Date.now() / 1000);
+    const payload = {
+      key: originalKey,
+      editedMessage,
+      messageTimestamp: editedMessageTimestamp,
+    };
+
+    await this.prismaRepository.message.update({
+      where: { id: originalMessage.id },
+      data: {
+        message: editedMessage as any,
+        messageTimestamp: editedMessageTimestamp,
+        status: 'EDITED',
+      },
+    });
+
+    if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+      await this.prismaRepository.messageUpdate.create({
+        data: {
+          fromMe: originalKey.fromMe,
+          keyId: originalKey.id,
+          remoteJid: originalKey.remoteJid,
+          participant: originalKey.participant,
+          status: 'EDITED',
+          instanceId: this.instanceId,
+          messageId: originalMessage.id,
+        },
+      });
+    }
+
+    this.sendDataWebhook(Events.MESSAGES_EDITED, payload);
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      await this.chatwootService.eventWhatsapp(
+        'messages.edit',
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        payload,
+      );
+    }
+  }
+
   private async defineAuthState() {
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -1123,15 +1171,6 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-              this.chatwootService.eventWhatsapp(
-                'messages.edit',
-                { instanceName: this.instance.name, instanceId: this.instance.id },
-                editedMessage,
-              );
-
-            await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
-
             if (received.key?.id && editedMessage.key?.id) {
               await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
             }
@@ -1140,26 +1179,14 @@ export class BaileysStartupService extends ChannelStartupService {
             if ((oldMessage as any)?.id) {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
                 ? Math.floor(received?.messageTimestamp.toNumber())
-                : Math.floor(received?.messageTimestamp as number);
+                : Number(received?.messageTimestamp) || Math.floor(Date.now() / 1000);
 
-              await this.prismaRepository.message.update({
-                where: { id: (oldMessage as any).id },
-                data: {
-                  message: editedMessage.editedMessage as any,
-                  messageTimestamp: editedMessageTimestamp,
-                  status: 'EDITED',
-                },
-              });
-              await this.prismaRepository.messageUpdate.create({
-                data: {
-                  fromMe: editedMessage.key.fromMe,
-                  keyId: editedMessage.key.id,
-                  remoteJid: editedMessage.key.remoteJid,
-                  status: 'EDITED',
-                  instanceId: this.instanceId,
-                  messageId: (oldMessage as any).id,
-                },
-              });
+              await this.persistEditedMessage(
+                oldMessage,
+                editedMessage.key,
+                editedMessage.editedMessage,
+                editedMessageTimestamp,
+              );
             }
           }
 
@@ -1650,6 +1677,15 @@ export class BaileysStartupService extends ChannelStartupService {
               continue;
             }
             message.messageId = findMessage.id;
+          }
+
+          const editedMessage = update.message?.editedMessage?.message;
+          if (editedMessage && findMessage?.id) {
+            const editedMessageTimestamp = Long.isLong(update.messageTimestamp)
+              ? Math.floor(update.messageTimestamp.toNumber())
+              : update.messageTimestamp;
+            await this.persistEditedMessage(findMessage, key, editedMessage, editedMessageTimestamp);
+            continue;
           }
 
           if (update.message === null && update.status === undefined) {
