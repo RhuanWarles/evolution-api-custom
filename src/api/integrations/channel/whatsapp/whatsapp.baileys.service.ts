@@ -4154,13 +4154,13 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private async formatUpdateMessage(data: UpdateMessageDto) {
+  private async formatUpdateMessage(data: UpdateMessageDto, existingMessage?: any) {
     try {
       if (!this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
         return data;
       }
 
-      const msg: any = await this.getMessage(data.key, true);
+      const msg: any = existingMessage || (await this.getMessage(data.key, true));
 
       if (msg?.messageType === 'conversation' || msg?.messageType === 'extendedTextMessage') {
         return { text: data.text };
@@ -4183,8 +4183,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async updateMessage(data: UpdateMessageDto) {
     const jid = createJid(data.number);
+    const saveNewMessage = this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE;
+    const oldMessage: any = saveNewMessage ? await this.getMessage(data.key, true) : undefined;
 
-    const options = await this.formatUpdateMessage(data);
+    if (saveNewMessage) {
+      if (!oldMessage) throw new NotFoundException('Message not found');
+      if (oldMessage?.key?.remoteJid !== jid) throw new BadRequestException('RemoteJid does not match');
+      if (!oldMessage?.key?.fromMe) throw new BadRequestException('You cannot edit others messages');
+      if (oldMessage?.key?.deleted) throw new BadRequestException('You cannot edit deleted messages');
+
+      const messageTimestamp = Number(oldMessage.messageTimestamp);
+      if (!Number.isFinite(messageTimestamp) || Math.floor(Date.now() / 1000) - messageTimestamp > 15 * 60) {
+        throw new BadRequestException('Message is older than 15 minutes');
+      }
+    }
+
+    const options = await this.formatUpdateMessage(data, oldMessage);
 
     if (!options) {
       this.logger.error('Message not compatible');
@@ -4192,18 +4206,6 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     try {
-      const oldMessage: any = await this.getMessage(data.key, true);
-      if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-        if (!oldMessage) throw new NotFoundException('Message not found');
-        if (oldMessage?.key?.remoteJid !== jid) {
-          throw new BadRequestException('RemoteJid does not match');
-        }
-        if (oldMessage?.messageTimestamp > Date.now() + 900000) {
-          // 15 minutes in milliseconds
-          throw new BadRequestException('Message is older than 15 minutes');
-        }
-      }
-
       const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: data.key });
       if (messageSent) {
         const editedMessage =
@@ -4218,19 +4220,12 @@ export class BaileysStartupService extends ChannelStartupService {
               editedMessage,
             );
 
-          const messageId = messageSent.message?.protocolMessage?.key?.id;
+          const messageId = data.key.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             let message = await this.prismaRepository.message.findFirst({
               where: { key: { path: ['id'], equals: messageId } },
             });
             if (!message) throw new NotFoundException('Message not found');
-
-            if (!(message.key.valueOf() as any).fromMe) {
-              new BadRequestException('You cannot edit others messages');
-            }
-            if ((message.key.valueOf() as any)?.deleted) {
-              new BadRequestException('You cannot edit deleted messages');
-            }
 
             if (oldMessage.messageType === 'conversation' || oldMessage.messageType === 'extendedTextMessage') {
               oldMessage.message.conversation = data.text;

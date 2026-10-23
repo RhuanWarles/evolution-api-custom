@@ -151,7 +151,9 @@ export const updateMessageSchema: JSONSchema7 = {
       properties: {
         id: { type: 'string' },
         remoteJid: { type: 'string' },
+        remoteJidAlt: { type: 'string' },
         fromMe: { type: 'boolean', enum: [true, false] },
+        participant: { type: 'string' },
       },
       required: ['id', 'fromMe', 'remoteJid'],
       ...isNotEmpty('id', 'remoteJid'),

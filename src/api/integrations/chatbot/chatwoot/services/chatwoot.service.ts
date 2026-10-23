@@ -1723,7 +1723,11 @@ export class ChatwootService {
         await chatwootRequest(this.getClientCwConfig(), {
           method: 'PATCH',
           url: `/api/v1/accounts/${this.provider.accountId}/conversations/${chatwootMessageIds.conversationId}/messages/${chatwootMessageIds.messageId}`,
-          body: { status: 'sent', external_error: null },
+          body: {
+            status: 'sent',
+            external_error: null,
+            content_attributes: { whatsapp_message_key: key },
+          },
         });
       } catch (error) {
         this.logger.error(`Error updating Chatwoot message source ID: ${error}`);
@@ -2491,6 +2495,11 @@ export class ChatwootService {
           return;
         }
 
+        if (!body?.key?.id) {
+          this.logger.warn('[CW.EDIT] Chave da mensagem original não encontrada');
+          return;
+        }
+
         const message = await this.getMessageByKeyId(instance, body?.key?.id);
 
         if (!message) {
@@ -2500,29 +2509,21 @@ export class ChatwootService {
 
         const key = message.key as WAMessageKey;
 
-        const messageType = key?.fromMe ? 'outgoing' : 'incoming';
-
-        if (message && message.chatwootConversationId && message.chatwootMessageId) {
-          // Criar nova mensagem com formato: "Mensagem editada:\n\nteste1"
-          const editedText = `\n\n\`${i18next.t('cw.message.edited')}:\`\n\n${editedMessageContent}`;
-
-          const send = await this.createMessage(
-            instance,
-            message.chatwootConversationId,
-            editedText,
-            messageType,
-            false,
-            [],
-            {
-              message: { extendedTextMessage: { contextInfo: { stanzaId: key.id } } },
+        if (message.chatwootConversationId && message.chatwootMessageId) {
+          await client.messages.update({
+            accountId: this.provider.accountId,
+            conversationId: message.chatwootConversationId,
+            messageId: message.chatwootMessageId,
+            data: {
+              content: editedMessageContent,
+              content_attributes: {
+                whatsapp_message_key: key,
+                whatsapp_message_edited: true,
+                whatsapp_message_edit_source: key.fromMe ? 'whatsapp_outgoing' : 'whatsapp_incoming',
+                whatsapp_message_edited_at: new Date().toISOString(),
+              },
             },
-            'WAID:' + body.key.id,
-            null,
-          );
-          if (!send) {
-            this.logger.warn('edited message not sent');
-            return;
-          }
+          });
         }
         return;
       }
