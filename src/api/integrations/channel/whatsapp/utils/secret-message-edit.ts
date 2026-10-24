@@ -1,4 +1,4 @@
-import { aesDecryptGCM, hkdf, jidNormalizedUser, proto } from 'baileys';
+import { aesDecryptGCM, hmacSign, jidNormalizedUser, proto } from 'baileys';
 
 export type SecretMessageEditResult = {
   key: proto.IMessageKey;
@@ -14,6 +14,29 @@ type SecretMessageEditInput = {
   meLid?: string;
   resolveLidToPn?: (jid: string) => Promise<string | undefined>;
   fallbackTimestamp?: number;
+  onDiagnostic?: (diagnostic: SecretMessageEditDiagnostic) => void;
+};
+
+export type SecretMessageEditFailure =
+  | 'invalid_envelope'
+  | 'target_not_found'
+  | 'message_secret_missing'
+  | 'payload_invalid'
+  | 'decrypt_auth_failed'
+  | 'decoded_payload_invalid'
+  | 'edited_content_missing';
+
+export type SecretMessageEditDiagnostic = {
+  failure?: SecretMessageEditFailure;
+  targetFound: boolean;
+  messageSecretLength: number;
+  payloadLength: number;
+  ivLength: number;
+  attempts: Array<{
+    originalSender: string;
+    editor: string;
+    authenticated: boolean;
+  }>;
 };
 
 const toBytes = (value: unknown): Uint8Array | null => {
@@ -36,8 +59,13 @@ const toBytes = (value: unknown): Uint8Array | null => {
 };
 
 const getMessageSecret = (message: proto.IWebMessageInfo | proto.IMessage | null | undefined) => {
-  const content = (message as proto.IWebMessageInfo)?.message ?? message;
-  return toBytes((content as proto.IMessage | undefined)?.messageContextInfo?.messageSecret);
+  const webMessageInfo = message as proto.IWebMessageInfo | undefined;
+  const content = webMessageInfo?.message ?? message;
+
+  return (
+    toBytes(webMessageInfo?.messageSecret) ||
+    toBytes((content as proto.IMessage | undefined)?.messageContextInfo?.messageSecret)
+  );
 };
 
 const toTimestamp = (value: unknown, fallback?: number) => {
@@ -62,9 +90,35 @@ const uniqueJids = (jids: Array<string | null | undefined>) => {
   return result;
 };
 
+const jidType = (jid: string) => {
+  if (jid.endsWith('@lid')) return 'LID';
+  if (jid.endsWith('@s.whatsapp.net')) return 'PN';
+  if (jid.endsWith('@g.us')) return 'GROUP';
+  return 'OTHER';
+};
+
 type MessageKeyWithAlt = proto.IMessageKey & {
   participantAlt?: string | null;
   remoteJidAlt?: string | null;
+};
+
+type MessageLookupRetryOptions = {
+  attempts?: number;
+  delayMs?: number;
+};
+
+export const retryMessageLookup = async <T>(
+  lookup: () => Promise<T | null | undefined>,
+  { attempts = 6, delayMs = 250 }: MessageLookupRetryOptions = {},
+) => {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const result = await lookup();
+
+    if (result) return result;
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  return undefined;
 };
 
 const keyJids = (key: proto.IMessageKey | null | undefined, meId: string, meLid?: string) => {
@@ -83,6 +137,24 @@ const keyJids = (key: proto.IMessageKey | null | undefined, meId: string, meLid?
 const targetMessageKey = (message: proto.IWebMessageInfo | proto.IMessage | null | undefined) =>
   (message as proto.IWebMessageInfo | undefined)?.key;
 
+export const deriveSecretMessageEditKey = (
+  messageSecret: Uint8Array,
+  targetMessageId: string,
+  originalSenderJid: string,
+  editorJid: string,
+) => {
+  const useCaseSecret = Buffer.concat([
+    Buffer.from(targetMessageId, 'utf8'),
+    Buffer.from(originalSenderJid, 'utf8'),
+    Buffer.from(editorJid, 'utf8'),
+    Buffer.from('Message Edit', 'utf8'),
+    Buffer.from([0x01]),
+  ]);
+  const intermediateKey = hmacSign(messageSecret, Buffer.alloc(32), 'sha256');
+
+  return hmacSign(useCaseSecret, intermediateKey, 'sha256');
+};
+
 export const isSecretMessageEdit = (message: proto.IMessage | null | undefined) =>
   message?.secretEncryptedMessage?.secretEncType === proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT;
 
@@ -94,21 +166,45 @@ export const decryptSecretMessageEdit = async ({
   meLid,
   resolveLidToPn,
   fallbackTimestamp,
+  onDiagnostic,
 }: SecretMessageEditInput): Promise<SecretMessageEditResult | null> => {
   const targetKey = envelope.targetMessageKey;
+  const targetFound = Boolean(targetMessage);
+  const messageSecret = getMessageSecret(targetMessage);
+  const encPayload = toBytes(envelope.encPayload);
+  const encIv = toBytes(envelope.encIv);
+  const diagnostic: SecretMessageEditDiagnostic = {
+    targetFound,
+    messageSecretLength: messageSecret?.length || 0,
+    payloadLength: encPayload?.length || 0,
+    ivLength: encIv?.length || 0,
+    attempts: [],
+  };
 
   if (
     envelope.secretEncType !== proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT ||
     !envelope.targetMessageKey?.id
   ) {
+    diagnostic.failure = 'invalid_envelope';
+    onDiagnostic?.(diagnostic);
     return null;
   }
 
-  const messageSecret = getMessageSecret(targetMessage);
-  const encPayload = toBytes(envelope.encPayload);
-  const encIv = toBytes(envelope.encIv);
+  if (!targetFound) {
+    diagnostic.failure = 'target_not_found';
+    onDiagnostic?.(diagnostic);
+    return null;
+  }
 
-  if (!messageSecret || !encPayload || !encIv) {
+  if (!messageSecret) {
+    diagnostic.failure = 'message_secret_missing';
+    onDiagnostic?.(diagnostic);
+    return null;
+  }
+
+  if (!encPayload || encPayload.length <= 16 || !encIv) {
+    diagnostic.failure = 'payload_invalid';
+    onDiagnostic?.(diagnostic);
     return null;
   }
 
@@ -129,20 +225,31 @@ export const decryptSecretMessageEdit = async ({
 
   for (const originalSenderJid of uniqueJids(resolvedOriginalJids)) {
     for (const editorJid of editorJids) {
-      const useCaseSecret = Buffer.concat([
-        Buffer.from(targetKey.id, 'utf8'),
-        Buffer.from(originalSenderJid, 'utf8'),
-        Buffer.from(editorJid, 'utf8'),
-        Buffer.from('Message Edit', 'utf8'),
-      ]);
-      const decryptionKey = await hkdf(messageSecret, 32, { info: useCaseSecret.toString('latin1') });
+      const decryptionKey = deriveSecretMessageEditKey(messageSecret, targetKey.id, originalSenderJid, editorJid);
+      const attempt = {
+        originalSender: jidType(originalSenderJid),
+        editor: jidType(editorJid),
+        authenticated: false,
+      };
+      diagnostic.attempts.push(attempt);
 
       try {
         const decrypted = aesDecryptGCM(encPayload, decryptionKey, encIv, Buffer.alloc(0));
-        const innerMessage = proto.Message.decode(decrypted);
+        attempt.authenticated = true;
+
+        let innerMessage: proto.Message;
+        try {
+          innerMessage = proto.Message.decode(decrypted);
+        } catch {
+          diagnostic.failure = 'decoded_payload_invalid';
+          continue;
+        }
+
         const editedMessage = innerMessage.protocolMessage?.editedMessage;
 
         if (!editedMessage) continue;
+
+        onDiagnostic?.(diagnostic);
 
         return {
           key: { ...messageKey, ...targetKey, id: targetKey.id },
@@ -155,5 +262,9 @@ export const decryptSecretMessageEdit = async ({
     }
   }
 
+  diagnostic.failure = diagnostic.attempts.some((attempt) => attempt.authenticated)
+    ? 'edited_content_missing'
+    : 'decrypt_auth_failed';
+  onDiagnostic?.(diagnostic);
   return null;
 };

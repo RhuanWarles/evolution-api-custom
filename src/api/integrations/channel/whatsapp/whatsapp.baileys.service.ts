@@ -154,7 +154,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
-import { decryptSecretMessageEdit, isSecretMessageEdit } from './utils/secret-message-edit';
+import { decryptSecretMessageEdit, isSecretMessageEdit, retryMessageLookup } from './utils/secret-message-edit';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -1173,13 +1173,36 @@ export class BaileysStartupService extends ChannelStartupService {
             ? await decryptSecretMessageEdit({
                 envelope: received.message.secretEncryptedMessage,
                 messageKey: received.key,
-                targetMessage: await this.getMessage(received.message.secretEncryptedMessage.targetMessageKey, true),
+                targetMessage: await retryMessageLookup(async () => {
+                  const targetMessage = await this.getMessage(
+                    received.message.secretEncryptedMessage.targetMessageKey,
+                    true,
+                  );
+
+                  const message = targetMessage as proto.IWebMessageInfo & { id?: string };
+
+                  return message.id ? message : null;
+                }),
                 meId: this.client.authState.creds.me?.id || this.client.user?.id || '',
                 meLid: this.client.authState.creds.me?.lid,
                 resolveLidToPn: (jid) => this.client.signalRepository.lidMapping.getPNForLID(jid),
                 fallbackTimestamp: Long.isLong(received.messageTimestamp)
                   ? Math.floor(received.messageTimestamp.toNumber())
                   : Number(received.messageTimestamp),
+                onDiagnostic: (diagnostic) => {
+                  const diagnosticMessage =
+                    `[MESSAGE_EDIT] target=${received.message.secretEncryptedMessage.targetMessageKey?.id || 'unknown'} ` +
+                    `result=${diagnostic.failure || 'decrypted'} ` +
+                    `targetFound=${diagnostic.targetFound} messageSecretLength=${diagnostic.messageSecretLength} ` +
+                    `payloadLength=${diagnostic.payloadLength} ivLength=${diagnostic.ivLength} ` +
+                    `attempts=${JSON.stringify(diagnostic.attempts)}`;
+
+                  if (diagnostic.failure) {
+                    this.logger.warn(diagnosticMessage);
+                  } else {
+                    this.logger.debug(diagnosticMessage);
+                  }
+                },
               })
             : null;
 

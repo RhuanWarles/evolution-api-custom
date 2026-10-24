@@ -5,8 +5,13 @@ import {
   extractEditedMessageText,
   whatsappMessageKeysMatch,
 } from '../src/api/integrations/chatbot/chatwoot/utils/message-edit';
-import { aesEncryptGCM, hkdf, proto } from 'baileys';
-import { decryptSecretMessageEdit, isSecretMessageEdit } from '../src/api/integrations/channel/whatsapp/utils/secret-message-edit';
+import { aesEncryptGCM, hmacSign, proto } from 'baileys';
+import {
+  decryptSecretMessageEdit,
+  deriveSecretMessageEditKey,
+  isSecretMessageEdit,
+  retryMessageLookup,
+} from '../src/api/integrations/channel/whatsapp/utils/secret-message-edit';
 
 const incomingKey = {
   id: 'wamid-1',
@@ -101,12 +106,6 @@ const editorKey = {
 };
 const originalSenderJid = targetKey.remoteJid;
 const editorJid = editorKey.remoteJid;
-const editContext = Buffer.concat([
-  Buffer.from(targetKey.id),
-  Buffer.from(originalSenderJid),
-  Buffer.from(editorJid),
-  Buffer.from('Message Edit'),
-]);
 const innerEdit = proto.Message.create({
   protocolMessage: proto.Message.ProtocolMessage.create({
     type: proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
@@ -116,7 +115,7 @@ const innerEdit = proto.Message.create({
   }),
 });
 void (async () => {
-  const editKey = await hkdf(messageSecret, 32, { info: editContext.toString('latin1') });
+  const editKey = deriveSecretMessageEditKey(messageSecret, targetKey.id, originalSenderJid, editorJid);
   const editEnvelope = {
     targetMessageKey: targetKey,
     encPayload: aesEncryptGCM(proto.Message.encode(innerEdit).finish(), editKey, Buffer.alloc(12, 3), Buffer.alloc(0)),
@@ -165,6 +164,97 @@ void (async () => {
     }),
     null,
   );
+
+  const ownTargetKey = {
+    id: 'original-outbound-id',
+    remoteJid: '556291212010@s.whatsapp.net',
+    remoteJidAlt: '181419536064672@lid',
+    fromMe: true,
+  };
+  const ownEditorKey = {
+    id: 'outbound-edit-envelope-id',
+    remoteJid: '556291212010@s.whatsapp.net',
+    remoteJidAlt: '181419536064672@lid',
+    fromMe: true,
+  };
+  const ownInnerEdit = proto.Message.create({
+    protocolMessage: proto.Message.ProtocolMessage.create({
+      type: proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
+      key: ownTargetKey,
+      editedMessage: proto.Message.create({ conversation: 'Mensagem outbound corrigida' }),
+      timestampMs: 1729688040000,
+    }),
+  });
+  const ownEditKey = deriveSecretMessageEditKey(
+    messageSecret,
+    ownTargetKey.id,
+    '181419536064672@lid',
+    '181419536064672@lid',
+  );
+  const ownEditEnvelope = {
+    targetMessageKey: ownTargetKey,
+    encPayload: aesEncryptGCM(
+      proto.Message.encode(ownInnerEdit).finish(),
+      ownEditKey,
+      Buffer.alloc(12, 4),
+      Buffer.alloc(0),
+    ),
+    encIv: Buffer.alloc(12, 4),
+    secretEncType: proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT,
+  };
+  const ownSecretEdit = await decryptSecretMessageEdit({
+    envelope: ownEditEnvelope,
+    messageKey: ownEditorKey,
+    targetMessage: {
+      key: ownTargetKey,
+      messageSecret,
+    },
+    meId: '556291212010@s.whatsapp.net',
+    meLid: '181419536064672@lid',
+  });
+  assert.equal(ownSecretEdit?.key.id, ownTargetKey.id);
+  assert.equal(ownSecretEdit?.key.fromMe, true);
+  assert.equal(ownSecretEdit?.editedMessage.conversation, 'Mensagem outbound corrigida');
+
+  const legacyContextWithoutVersionByte = Buffer.concat([
+    Buffer.from(targetKey.id),
+    Buffer.from(originalSenderJid),
+    Buffer.from(editorJid),
+    Buffer.from('Message Edit'),
+  ]);
+  const legacyIntermediateKey = hmacSign(messageSecret, Buffer.alloc(32), 'sha256');
+  const legacyKey = hmacSign(legacyContextWithoutVersionByte, legacyIntermediateKey, 'sha256');
+  const legacyEnvelope = {
+    ...editEnvelope,
+    encPayload: aesEncryptGCM(
+      proto.Message.encode(innerEdit).finish(),
+      legacyKey,
+      Buffer.alloc(12, 5),
+      Buffer.alloc(0),
+    ),
+    encIv: Buffer.alloc(12, 5),
+  };
+  assert.equal(
+    await decryptSecretMessageEdit({
+      envelope: legacyEnvelope,
+      messageKey: editorKey,
+      targetMessage: { messageContextInfo: { messageSecret } },
+      meId: '556294665004@s.whatsapp.net',
+      meLid: '181419536064672@lid',
+    }),
+    null,
+  );
+
+  let lookupAttempts = 0;
+  const delayedTarget = await retryMessageLookup(
+    async () => {
+      lookupAttempts += 1;
+      return lookupAttempts === 2 ? { id: 'original-outbound-id' } : undefined;
+    },
+    { attempts: 3, delayMs: 0 },
+  );
+  assert.equal(delayedTarget?.id, 'original-outbound-id');
+  assert.equal(lookupAttempts, 2);
 
   console.log('secret message edit contract tests passed');
 })().catch((error) => {
