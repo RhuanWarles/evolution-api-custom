@@ -64,10 +64,17 @@ export const getMessageSecret = (message: proto.IWebMessageInfo | proto.IMessage
   const persistedContextInfo = (
     webMessageInfo as (proto.IWebMessageInfo & { contextInfo?: proto.IMessageContextInfo }) | undefined
   )?.contextInfo;
+  const nestedContextInfo =
+    content && typeof content === 'object'
+      ? Object.values(content as Record<string, unknown>)
+          .map((value) => (value as { contextInfo?: proto.IMessageContextInfo } | null)?.contextInfo)
+          .find((contextInfo) => contextInfo?.messageSecret)
+      : undefined;
 
   return (
     toBytes(webMessageInfo?.messageSecret) ||
     toBytes((content as proto.IMessage | undefined)?.messageContextInfo?.messageSecret) ||
+    toBytes(nestedContextInfo?.messageSecret) ||
     toBytes(persistedContextInfo?.messageSecret)
   );
 };

@@ -104,6 +104,12 @@ assert.equal(
   messageSecret.length,
 );
 assert.equal(
+  getMessageSecret({
+    message: { extendedTextMessage: { text: 'Mensagem original', contextInfo: { messageSecret } } },
+  })?.length,
+  messageSecret.length,
+);
+assert.equal(
   getMessageSecret({ message: { conversation: 'Mensagem original' }, contextInfo: { messageSecret } } as any)?.length,
   messageSecret.length,
 );
