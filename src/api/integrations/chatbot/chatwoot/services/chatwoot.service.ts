@@ -16,6 +16,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
 import { buildGroupContactUpdate } from '@api/integrations/chatbot/chatwoot/utils/group-contact-metadata';
 import {
+  buildChatwootMessageEditRequest,
   extractEditedMessageText,
   whatsappMessageKeysMatch,
 } from '@api/integrations/chatbot/chatwoot/utils/message-edit';
@@ -2555,21 +2556,11 @@ export class ChatwootService {
       }
 
       if (event === 'messages.edit' || event === 'send.message.update') {
-        this.logger.info(
-          `[CW.EDIT] Received event=${event} key=${body?.key?.id || 'missing'} ` +
-            `remoteJid=${body?.key?.remoteJid || 'missing'}`,
-        );
         const editedMessageContent = extractEditedMessageText(body);
 
-        if (!editedMessageContent) {
-          this.logger.info('[CW.EDIT] Conteúdo vazio — ignorando (DELETE tratará se for revoke).');
-          return;
-        }
+        if (!editedMessageContent) return;
 
-        if (!body?.key?.id) {
-          this.logger.warn('[CW.EDIT] Chave da mensagem original não encontrada');
-          return;
-        }
+        if (!body?.key?.id) return;
 
         const message = await this.getMessageByKeyId(instance, body?.key?.id);
         const chatwootMessage =
@@ -2597,28 +2588,20 @@ export class ChatwootService {
             whatsapp_message_edited_at: new Date().toISOString(),
           };
 
-          this.logger.info(
-            `[CW.EDIT] Updating Chatwoot message=${chatwootMessage.chatwootMessageId} ` +
-              `conversation=${chatwootMessage.chatwootConversationId} key=${key.id}`,
+          // External WhatsApp edits use a dedicated sync endpoint so they do
+          // not go through the agent's manual-edit eligibility rules.
+          await chatwootRequest(
+            this.getClientCwConfig(),
+            buildChatwootMessageEditRequest({
+              accountId: this.provider.accountId,
+              conversationId: chatwootMessage.chatwootConversationId,
+              messageId: chatwootMessage.chatwootMessageId,
+              content: editedMessageContent,
+              instanceName: instance.instanceName,
+              editedAt: contentAttributes.whatsapp_message_edited_at,
+              key,
+            }),
           );
-
-          try {
-            // The SDK update endpoint uses multipart/form-data. Rails expects
-            // content_attributes as a JSON object for this internal update.
-            await chatwootRequest(this.getClientCwConfig(), {
-              method: 'PATCH',
-              url: `/api/v1/accounts/${this.provider.accountId}/conversations/${chatwootMessage.chatwootConversationId}/messages/${chatwootMessage.chatwootMessageId}`,
-              body: {
-                content: editedMessageContent,
-                content_attributes: contentAttributes,
-              },
-            });
-          } catch (error) {
-            this.logger.error(
-              `[CW.EDIT] Chatwoot update failed for key=${key.id}: ${error instanceof Error ? error.message : 'unknown error'}`,
-            );
-            throw error;
-          }
         }
         return;
       }

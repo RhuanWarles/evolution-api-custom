@@ -53,6 +53,7 @@ import {
   TypeButton,
 } from '@api/dto/sendMessage.dto';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { extractEditedMessageEvent } from '@api/integrations/chatbot/chatwoot/utils/message-edit';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
@@ -153,6 +154,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { decryptSecretMessageEdit, isSecretMessageEdit } from './utils/secret-message-edit';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -1167,33 +1169,58 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const editedMessage =
-            received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          const secretMessageEdit = isSecretMessageEdit(received.message)
+            ? await decryptSecretMessageEdit({
+                envelope: received.message.secretEncryptedMessage,
+                messageKey: received.key,
+                targetMessage: await this.getMessage(received.message.secretEncryptedMessage.targetMessageKey, true),
+                meId: this.client.authState.creds.me?.id || this.client.user?.id || '',
+                meLid: this.client.authState.creds.me?.lid,
+                resolveLidToPn: (jid) => this.client.signalRepository.lidMapping.getPNForLID(jid),
+                fallbackTimestamp: Long.isLong(received.messageTimestamp)
+                  ? Math.floor(received.messageTimestamp.toNumber())
+                  : Number(received.messageTimestamp),
+              })
+            : null;
 
-          if (editedMessage) {
-            if (received.key?.id && editedMessage.key?.id) {
-              await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
+          if (isSecretMessageEdit(received.message) && !secretMessageEdit) {
+            continue;
+          }
+          const editedEvent = secretMessageEdit && {
+            key: secretMessageEdit.key,
+            editedMessage: secretMessageEdit.editedMessage,
+            messageTimestamp: secretMessageEdit.messageTimestamp,
+          };
+          const legacyEditedEvent = editedEvent || extractEditedMessageEvent(received);
+
+          if (legacyEditedEvent) {
+            if (received.key?.id && legacyEditedEvent.key?.id) {
+              await this.baileysCache.set(`protocol_${received.key.id}`, legacyEditedEvent.key.id, 60 * 60 * 24);
             }
 
-            const oldMessage = await this.getMessage(editedMessage.key, true);
+            const oldMessage = await this.getMessage(legacyEditedEvent.key, true);
             if ((oldMessage as any)?.id) {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
                 ? Math.floor(received?.messageTimestamp.toNumber())
-                : Number(received?.messageTimestamp) || Math.floor(Date.now() / 1000);
+                : Number(legacyEditedEvent.messageTimestamp) ||
+                  Number(received?.messageTimestamp) ||
+                  Math.floor(Date.now() / 1000);
 
               await this.persistEditedMessage(
                 oldMessage,
-                editedMessage.key,
-                editedMessage.editedMessage,
+                legacyEditedEvent.key,
+                legacyEditedEvent.editedMessage,
                 editedMessageTimestamp,
               );
             } else {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
                 ? Math.floor(received?.messageTimestamp.toNumber())
-                : Number(received?.messageTimestamp) || Math.floor(Date.now() / 1000);
+                : Number(legacyEditedEvent.messageTimestamp) ||
+                  Number(received?.messageTimestamp) ||
+                  Math.floor(Date.now() / 1000);
               const payload = {
-                key: editedMessage.key,
-                editedMessage: editedMessage.editedMessage,
+                key: legacyEditedEvent.key,
+                editedMessage: legacyEditedEvent.editedMessage,
                 messageTimestamp: editedMessageTimestamp,
               };
               this.sendDataWebhook(Events.MESSAGES_EDITED, payload);
@@ -1207,7 +1234,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
+          if ((type !== 'notify' && type !== 'append') || legacyEditedEvent || !received?.message) {
             continue;
           }
 
@@ -1668,14 +1695,14 @@ export class BaileysStartupService extends ChannelStartupService {
             message.message = update.message;
           }
 
-          const editedMessage = update.message?.editedMessage?.message;
-          if (editedMessage) {
+          const editedEvent = extractEditedMessageEvent({ ...update, key });
+          if (editedEvent) {
             const editedMessageTimestamp = Long.isLong(update.messageTimestamp)
               ? Math.floor(update.messageTimestamp.toNumber())
               : update.messageTimestamp;
             const payload = {
-              key,
-              editedMessage,
+              key: editedEvent.key,
+              editedMessage: editedEvent.editedMessage,
               messageTimestamp: editedMessageTimestamp,
             };
             const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
@@ -1684,7 +1711,7 @@ export class BaileysStartupService extends ChannelStartupService {
             if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
               const protocolMapKey = `protocol_${key.id}`;
               const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
-              const searchId = originalMessageId || key.id;
+              const searchId = originalMessageId || editedEvent.key.id;
               const messages = (await this.prismaRepository.$queryRaw`
                 SELECT * FROM "Message"
                 WHERE "instanceId" = ${this.instanceId}
@@ -1695,7 +1722,12 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (originalMessage?.id) {
-              await this.persistEditedMessage(originalMessage, key, editedMessage, editedMessageTimestamp);
+              await this.persistEditedMessage(
+                originalMessage,
+                editedEvent.key,
+                editedEvent.editedMessage,
+                editedMessageTimestamp,
+              );
             } else {
               this.sendDataWebhook(Events.MESSAGES_EDITED, payload);
               if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
