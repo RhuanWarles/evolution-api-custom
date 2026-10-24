@@ -72,14 +72,15 @@ export const getMessageSecret = (message: proto.IWebMessageInfo | proto.IMessage
   );
 };
 
-export const preserveMessageSecret = (message: proto.IMessage, messageSecret?: Uint8Array | null) => {
-  if (!messageSecret?.length) return message;
+export const preserveMessageSecret = (message: proto.IMessage, messageSecret?: unknown) => {
+  const normalizedSecret = toBytes(messageSecret);
+  if (!normalizedSecret?.length) return message;
 
   return {
     ...message,
     messageContextInfo: {
       ...message.messageContextInfo,
-      messageSecret,
+      messageSecret: normalizedSecret,
     },
   };
 };

@@ -96,6 +96,9 @@ console.log('message-edit contract tests passed');
 const messageSecret = Buffer.alloc(32, 7);
 const persistedMessage = preserveMessageSecret({ conversation: 'Mensagem original' }, messageSecret);
 assert.equal(getMessageSecret({ message: persistedMessage })?.length, messageSecret.length);
+const serializedSecret = { type: 'Buffer', data: [...messageSecret] };
+const serializedPersistedMessage = preserveMessageSecret({ conversation: 'Mensagem original' }, serializedSecret);
+assert.equal(getMessageSecret({ message: serializedPersistedMessage })?.length, messageSecret.length);
 assert.equal(
   getMessageSecret({ message: { conversation: 'Mensagem original' }, contextInfo: { messageSecret } } as any)?.length,
   messageSecret.length,
