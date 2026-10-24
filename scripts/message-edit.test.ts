@@ -9,7 +9,9 @@ import { aesEncryptGCM, hmacSign, proto } from 'baileys';
 import {
   decryptSecretMessageEdit,
   deriveSecretMessageEditKey,
+  getMessageSecret,
   isSecretMessageEdit,
+  preserveMessageSecret,
   retryMessageLookup,
 } from '../src/api/integrations/channel/whatsapp/utils/secret-message-edit';
 
@@ -92,6 +94,14 @@ assert.equal(
 console.log('message-edit contract tests passed');
 
 const messageSecret = Buffer.alloc(32, 7);
+const persistedMessage = preserveMessageSecret({ conversation: 'Mensagem original' }, messageSecret);
+assert.equal(getMessageSecret({ message: persistedMessage })?.length, messageSecret.length);
+assert.equal(
+  getMessageSecret({ message: { conversation: 'Mensagem original' }, contextInfo: { messageSecret } } as any)?.length,
+  messageSecret.length,
+);
+assert.equal(getMessageSecret({ messageSecret } as proto.IWebMessageInfo)?.length, messageSecret.length);
+
 const targetKey = {
   id: 'original-inbound-id',
   remoteJid: '181419536064672@lid',

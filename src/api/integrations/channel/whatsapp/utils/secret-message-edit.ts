@@ -58,14 +58,30 @@ const toBytes = (value: unknown): Uint8Array | null => {
   return null;
 };
 
-const getMessageSecret = (message: proto.IWebMessageInfo | proto.IMessage | null | undefined) => {
+export const getMessageSecret = (message: proto.IWebMessageInfo | proto.IMessage | null | undefined) => {
   const webMessageInfo = message as proto.IWebMessageInfo | undefined;
   const content = webMessageInfo?.message ?? message;
+  const persistedContextInfo = (
+    webMessageInfo as (proto.IWebMessageInfo & { contextInfo?: proto.IMessageContextInfo }) | undefined
+  )?.contextInfo;
 
   return (
     toBytes(webMessageInfo?.messageSecret) ||
-    toBytes((content as proto.IMessage | undefined)?.messageContextInfo?.messageSecret)
+    toBytes((content as proto.IMessage | undefined)?.messageContextInfo?.messageSecret) ||
+    toBytes(persistedContextInfo?.messageSecret)
   );
+};
+
+export const preserveMessageSecret = (message: proto.IMessage, messageSecret?: Uint8Array | null) => {
+  if (!messageSecret?.length) return message;
+
+  return {
+    ...message,
+    messageContextInfo: {
+      ...message.messageContextInfo,
+      messageSecret,
+    },
+  };
 };
 
 const toTimestamp = (value: unknown, fallback?: number) => {

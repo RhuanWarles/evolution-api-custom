@@ -154,7 +154,13 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
-import { decryptSecretMessageEdit, isSecretMessageEdit, retryMessageLookup } from './utils/secret-message-edit';
+import {
+  decryptSecretMessageEdit,
+  getMessageSecret,
+  isSecretMessageEdit,
+  preserveMessageSecret,
+  retryMessageLookup,
+} from './utils/secret-message-edit';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -568,11 +574,12 @@ export class BaileysStartupService extends ChannelStartupService {
       editedMessage,
       messageTimestamp: editedMessageTimestamp,
     };
+    const persistedEditedMessage = preserveMessageSecret(editedMessage, getMessageSecret(originalMessage));
 
     await this.prismaRepository.message.update({
       where: { id: originalMessage.id },
       data: {
-        message: editedMessage as any,
+        message: persistedEditedMessage as any,
         messageTimestamp: editedMessageTimestamp,
         status: 'EDITED',
       },
@@ -4812,6 +4819,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private prepareMessage(message: proto.IWebMessageInfo): any {
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
+    const persistedMessage = this.deserializeMessageBuffers({ ...message.message });
+    const messageSecret = this.deserializeMessageBuffers(message.messageSecret);
 
     const messageRaw = {
       key: message.key, // Save key exactly as it comes from Baileys
@@ -4821,7 +4830,7 @@ export class BaileysStartupService extends ChannelStartupService {
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
       status: status[message.status],
-      message: this.deserializeMessageBuffers({ ...message.message }),
+      message: preserveMessageSecret(persistedMessage, messageSecret),
       contextInfo: this.deserializeMessageBuffers(contentMsg?.contextInfo),
       messageType: contentType || 'unknown',
       messageTimestamp: Long.isLong(message.messageTimestamp)
