@@ -100,6 +100,10 @@ const serializedSecret = { type: 'Buffer', data: [...messageSecret] };
 const serializedPersistedMessage = preserveMessageSecret({ conversation: 'Mensagem original' }, serializedSecret);
 assert.equal(getMessageSecret({ message: serializedPersistedMessage })?.length, messageSecret.length);
 assert.equal(
+  getMessageSecret({ message: { conversation: 'Mensagem original', messageContextInfo: { messageSecret } } })?.length,
+  messageSecret.length,
+);
+assert.equal(
   getMessageSecret({ message: { conversation: 'Mensagem original' }, contextInfo: { messageSecret } } as any)?.length,
   messageSecret.length,
 );

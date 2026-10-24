@@ -4820,7 +4820,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
     const persistedMessage = this.deserializeMessageBuffers({ ...message.message });
-    const messageSecret = this.deserializeMessageBuffers(message.messageSecret);
+    const messageSecret = getMessageSecret(message);
 
     const messageRaw = {
       key: message.key, // Save key exactly as it comes from Baileys
