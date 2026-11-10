@@ -15,6 +15,7 @@ import {
   selectPreferredPhoneContact,
 } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
 import { buildGroupContactUpdate } from '@api/integrations/chatbot/chatwoot/utils/group-contact-metadata';
+import { buildGroupMessageContent } from '@api/integrations/chatbot/chatwoot/utils/group-participant-header';
 import {
   buildChatwootMessageEditRequest,
   extractEditedMessageText,
@@ -45,7 +46,6 @@ import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
 import FormData from 'form-data';
 import { Jimp, JimpMime } from 'jimp';
-import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import path from 'path';
@@ -2311,22 +2311,7 @@ export class ChatwootService {
           fileStream.push(null);
 
           if (body.key.remoteJid.includes('@g.us')) {
-            const participantName = body.pushName;
-            const rawPhoneNumber =
-              body.key.addressingMode === 'lid' && !body.key.fromMe && body.key.participantAlt
-                ? body.key.participantAlt.split('@')[0].split(':')[0]
-                : body.key.participant.split('@')[0].split(':')[0];
-            const formattedPhoneNumber = parsePhoneNumberFromString(`+${rawPhoneNumber}`).formatInternational();
-
-            let content: string;
-
-            if (!body.key.fromMe) {
-              content = bodyMessage
-                ? `**${formattedPhoneNumber} - ${participantName}:**\n\n${bodyMessage}`
-                : `**${formattedPhoneNumber} - ${participantName}:**`;
-            } else {
-              content = bodyMessage || '';
-            }
+            const content = buildGroupMessageContent(body, bodyMessage);
 
             const send = await this.sendData(
               getConversation,
@@ -2469,20 +2454,7 @@ export class ChatwootService {
         }
 
         if (body.key.remoteJid.includes('@g.us')) {
-          const participantName = body.pushName;
-          const rawPhoneNumber =
-            body.key.addressingMode === 'lid' && !body.key.fromMe && body.key.participantAlt
-              ? body.key.participantAlt.split('@')[0].split(':')[0]
-              : body.key.participant.split('@')[0].split(':')[0];
-          const formattedPhoneNumber = parsePhoneNumberFromString(`+${rawPhoneNumber}`).formatInternational();
-
-          let content: string;
-
-          if (!body.key.fromMe) {
-            content = `**${formattedPhoneNumber} - ${participantName}:**\n\n${bodyMessage}`;
-          } else {
-            content = `${bodyMessage}`;
-          }
+          const content = buildGroupMessageContent(body, bodyMessage);
 
           const send = await this.createMessage(
             instance,
