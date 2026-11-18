@@ -1266,6 +1266,12 @@ export class ChatwootService {
     }
   }
 
+  private isAudioAttachment(attachment: any): boolean {
+    // Mesmo critério de sendAttachment (extensão -> mime), sem a consulta HTTP de fallback.
+    const ext = path.parse(decodeURIComponent(attachment?.data_url ?? '')).ext;
+    return (mimeTypes.lookup(ext) || '').startsWith('audio/');
+  }
+
   public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
     try {
       const parsedMedia = path.parse(decodeURIComponent(media));
@@ -1554,21 +1560,25 @@ export class ChatwootService {
 
         for (const message of body.conversation.messages) {
           if (message.attachments && message.attachments.length > 0) {
-            for (const attachment of message.attachments) {
-              if (!messageReceived) {
-                formatText = null;
-              }
+            // Legenda (texto + assinatura) só no primeiro anexo que aceita legenda.
+            // Áudio ignora caption, então é pulado.
+            const captionIndex = messageReceived
+              ? message.attachments.findIndex((a: any) => !this.isAudioAttachment(a))
+              : -1;
+
+            for (const [index, attachment] of message.attachments.entries()) {
+              const caption = index === captionIndex ? formatText : null;
 
               const options: Options = {
                 quoted: await this.getQuotedMessage(body, instance),
-                ...(mentioned.length ? { mentioned } : {}),
+                ...(caption && mentioned.length ? { mentioned } : {}),
               };
 
               const messageSent = await this.sendAttachment(
                 waInstance,
                 chatId,
                 attachment.data_url,
-                formatText,
+                caption,
                 options,
               );
               if (!messageSent && body.conversation?.id) {
