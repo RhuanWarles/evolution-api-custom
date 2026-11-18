@@ -1574,13 +1574,7 @@ export class ChatwootService {
                 ...(caption && mentioned.length ? { mentioned } : {}),
               };
 
-              const messageSent = await this.sendAttachment(
-                waInstance,
-                chatId,
-                attachment.data_url,
-                caption,
-                options,
-              );
+              const messageSent = await this.sendAttachment(waInstance, chatId, attachment.data_url, caption, options);
               if (!messageSent && body.conversation?.id) {
                 this.onSendMessageError(instance, body.conversation?.id);
               }
