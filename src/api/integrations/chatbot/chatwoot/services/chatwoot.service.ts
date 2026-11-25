@@ -14,6 +14,12 @@ import {
   normalizeWhatsAppPhoneWithPlus,
   selectPreferredPhoneContact,
 } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
+import {
+  classifyChatwootError,
+  DEFAULT_RETRY_DELAYS_MS,
+  DeliveryOutcome,
+  OrderedRetryQueue,
+} from '@api/integrations/chatbot/chatwoot/utils/delivery-retry';
 import { buildGroupContactUpdate } from '@api/integrations/chatbot/chatwoot/utils/group-contact-metadata';
 import { hasDisplayName, resolveParticipantPhoneJid } from '@api/integrations/chatbot/chatwoot/utils/group-participant';
 import { buildGroupMessageContent } from '@api/integrations/chatbot/chatwoot/utils/group-participant-header';
@@ -52,6 +58,8 @@ import mimeTypes from 'mime-types';
 import path from 'path';
 import { Readable } from 'stream';
 
+type PendingDelivery = { id: string; remoteJid: string; event: string; enqueuedAt: number };
+
 interface ChatwootMessage {
   messageId?: number;
   inboxId?: number;
@@ -65,6 +73,16 @@ export class ChatwootService {
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
+
+  // How long a pending (undelivered) message stays recoverable after a restart
+  private readonly PENDING_DELIVERY_TTL_SECONDS = 6 * 60 * 60;
+
+  private retryQueue = new OrderedRetryQueue(DEFAULT_RETRY_DELAYS_MS, undefined, (error) =>
+    this.logger.error(`Unexpected error in Chatwoot delivery retry: ${error instanceof Error ? error.message : error}`),
+  );
+
+  // Messages currently queued for retry in this process (avoids queuing the same message twice on reconnect)
+  private readonly inFlightDeliveries = new Set<string>();
 
   private provider: any;
 
@@ -366,6 +384,7 @@ export class ChatwootService {
 
       return contact;
     } catch (error) {
+      if (classifyChatwootError(error) === 'retry') throw error;
       if (error.status === 422 || error.response?.status === 422) {
         this.logger.warn(`Contact creation failed (422). Re-resolving the canonical contact identity...`);
         const phoneContacts = jid ? await this.findContactsByPhone(instance, phoneNumber) : [];
@@ -964,6 +983,8 @@ export class ChatwootService {
         this.logger.verbose(`Block released for: ${lockKey}`);
       }
     } catch (error) {
+      // The lock is already released (finally above). Let the delivery layer retry when Chatwoot is down.
+      if (classifyChatwootError(error) === 'retry') throw error;
       this.logger.error(`Error in createConversation: ${error}`);
       return null;
     }
@@ -1200,6 +1221,7 @@ export class ChatwootService {
 
       return data;
     } catch (error) {
+      if (classifyChatwootError(error) === 'retry') throw error;
       this.logger.error(error);
     }
   }
@@ -2183,7 +2205,172 @@ export class ChatwootService {
     );
   }
 
+  /**
+   * Entry point for WhatsApp events. Messages are delivered with a first inline attempt; when Chatwoot is
+   * unavailable the delivery is moved to a background, per-conversation ordered retry queue so the caller
+   * (and other conversations) are never blocked while waiting.
+   */
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
+    const isMessageEvent = event === 'messages.upsert' || event === 'send.message';
+    if (!isMessageEvent || !body?.key?.id || !body?.key?.remoteJid) {
+      return this.handleWhatsappEvent(event, instance, body);
+    }
+
+    const chatKey = `${instance.instanceName}:${body.key.remoteJid}`;
+
+    // An earlier message of this conversation is still being retried: queue behind it to keep the order.
+    if (this.retryQueue.hasPending(chatKey)) {
+      await this.persistPendingDelivery(instance, event, body);
+      this.scheduleDeliveryRetry(chatKey, event, instance, body, true);
+      return null;
+    }
+
+    try {
+      return await this.handleWhatsappEvent(event, instance, body, true);
+    } catch (error) {
+      this.logger.warn(
+        `Chatwoot unavailable (${this.describeError(error)}); retrying delivery of ${body.key.id} in background`,
+      );
+      await this.persistPendingDelivery(instance, event, body);
+      this.scheduleDeliveryRetry(chatKey, event, instance, body, false);
+      return null;
+    }
+  }
+
+  private describeError(error: any): string {
+    return String(error?.code || error?.status || error?.name || 'error');
+  }
+
+  private pendingDeliveriesKey(instance: InstanceDto) {
+    return `chatwoot:pendingDeliveries:${instance.instanceName}`;
+  }
+
+  /** Pending deliveries only keep ids (never message content); the message is reloaded from the Message table. */
+  private async readPendingDeliveries(instance: InstanceDto): Promise<PendingDelivery[]> {
+    const stored = await this.cache.get(this.pendingDeliveriesKey(instance));
+    return Array.isArray(stored) ? stored : [];
+  }
+
+  private async persistPendingDelivery(instance: InstanceDto, event: string, body: any) {
+    try {
+      const pending = (await this.readPendingDeliveries(instance)).filter((item) => item.id !== body.key.id);
+      pending.push({ id: body.key.id, remoteJid: body.key.remoteJid, event, enqueuedAt: Date.now() });
+      await this.cache.set(this.pendingDeliveriesKey(instance), pending, this.PENDING_DELIVERY_TTL_SECONDS);
+    } catch (error) {
+      this.logger.warn(`Could not persist pending delivery ${body?.key?.id}: ${this.describeError(error)}`);
+    }
+  }
+
+  private async removePendingDelivery(instance: InstanceDto, messageId: string) {
+    try {
+      const pending = await this.readPendingDeliveries(instance);
+      const remaining = pending.filter((item) => item.id !== messageId);
+      if (remaining.length === pending.length) return;
+
+      if (remaining.length === 0) {
+        await this.cache.delete(this.pendingDeliveriesKey(instance));
+      } else {
+        await this.cache.set(this.pendingDeliveriesKey(instance), remaining, this.PENDING_DELIVERY_TTL_SECONDS);
+      }
+    } catch (error) {
+      this.logger.warn(`Could not clear pending delivery ${messageId}: ${this.describeError(error)}`);
+    }
+  }
+
+  private scheduleDeliveryRetry(chatKey: string, event: string, instance: InstanceDto, body: any, immediate: boolean) {
+    const { id, remoteJid } = body.key;
+    const inFlightKey = `${chatKey}:${id}`;
+    if (this.inFlightDeliveries.has(inFlightKey)) return;
+    this.inFlightDeliveries.add(inFlightKey);
+
+    this.retryQueue.enqueue(chatKey, {
+      label: id,
+      immediate,
+      attempt: () => this.attemptDelivery(event, instance, body),
+      onExhausted: (attempts) =>
+        this.logger.error(
+          `Chatwoot delivery abandoned after ${attempts} attempts: instance=${instance.instanceName} id=${id} remoteJid=${remoteJid}`,
+        ),
+      onSettled: async () => {
+        this.inFlightDeliveries.delete(inFlightKey);
+        await this.removePendingDelivery(instance, id);
+      },
+    });
+  }
+
+  private async attemptDelivery(event: string, instance: InstanceDto, body: any): Promise<DeliveryOutcome> {
+    try {
+      // Chatwoot may have stored the message even though the response was lost: never post it twice.
+      try {
+        const existing = await this.findChatwootMessageByKey(instance, body.key as WAMessageKey);
+        if (existing) {
+          await this.saveChatwootIds(instance, body.key.id, {
+            id: existing.chatwootMessageId,
+            conversation_id: existing.chatwootConversationId,
+          });
+          return 'delivered';
+        }
+      } catch (error) {
+        if (classifyChatwootError(error) === 'retry') return 'retry';
+        this.logger.warn(`Duplicate check failed for ${body.key.id}: ${this.describeError(error)}`);
+      }
+
+      const sent = await this.handleWhatsappEvent(event, instance, body, true);
+      if (sent?.id) await this.saveChatwootIds(instance, body.key.id, sent);
+
+      return 'delivered';
+    } catch (error) {
+      return classifyChatwootError(error) === 'retry' ? 'retry' : 'give-up';
+    }
+  }
+
+  /** The Message row is written by the caller after the first attempt; link it once delivery succeeds. */
+  private async saveChatwootIds(instance: InstanceDto, messageId: string, sent: any) {
+    const data = {
+      chatwootMessageId: sent.id,
+      chatwootConversationId: sent.conversation_id,
+      ...(sent.inbox_id ? { chatwootInboxId: sent.inbox_id } : {}),
+    };
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const result = await this.prismaRepository.message.updateMany({
+          where: { instanceId: instance.instanceId, key: { path: ['id'], equals: messageId } },
+          data,
+        });
+        if (result.count > 0) return;
+      } catch (error) {
+        this.logger.warn(`Could not link message ${messageId} to Chatwoot: ${this.describeError(error)}`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+    }
+  }
+
+  /** Re-queues deliveries that were pending when the process stopped (needs a persistent cache such as Redis). */
+  public async resumePendingDeliveries(instance: InstanceDto) {
+    try {
+      const pending = await this.readPendingDeliveries(instance);
+      const oldest = Date.now() - this.PENDING_DELIVERY_TTL_SECONDS * 1000;
+
+      for (const item of pending) {
+        const row = await this.prismaRepository.message.findFirst({
+          where: { instanceId: instance.instanceId, key: { path: ['id'], equals: item.id } },
+        });
+
+        if (!row || item.enqueuedAt < oldest) {
+          await this.removePendingDelivery(instance, item.id);
+          continue;
+        }
+
+        this.scheduleDeliveryRetry(`${instance.instanceName}:${item.remoteJid}`, item.event, instance, row, true);
+      }
+    } catch (error) {
+      this.logger.warn(`Could not resume pending Chatwoot deliveries: ${this.describeError(error)}`);
+    }
+  }
+
+  private async handleWhatsappEvent(event: string, instance: InstanceDto, body: any, rethrowRetryable = false) {
     try {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
@@ -2711,6 +2898,7 @@ export class ChatwootService {
         }
       }
     } catch (error) {
+      if (rethrowRetryable && classifyChatwootError(error) === 'retry') throw error;
       this.logger.error(error);
     }
   }

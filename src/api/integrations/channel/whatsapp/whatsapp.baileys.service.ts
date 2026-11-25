@@ -513,6 +513,10 @@ export class BaileysStartupService extends ChannelStartupService {
           { instance: this.instance.name, status: 'open' },
         );
         this.syncChatwootLostMessages();
+        void this.chatwootService.resumePendingDeliveries({
+          instanceName: this.instance.name,
+          instanceId: this.instanceId,
+        });
       }
 
       this.sendDataWebhook(Events.CONNECTION_UPDATE, {
