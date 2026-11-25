@@ -1,5 +1,7 @@
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
 
+import { hasDisplayName, isLidJid, resolveParticipantPhoneJid } from './group-participant';
+
 type GroupMessageBody = {
   pushName?: string | null;
   participant?: string | null;
@@ -10,40 +12,26 @@ type GroupMessageBody = {
   } | null;
 };
 
-const isLidJid = (jid: string) => /@(hosted\.)?lid$/.test(jid);
-
-const jidToNumber = (jid: string) => jid.split('@')[0].split(':')[0].trim();
-
-/**
- * Picks the JID that identifies who sent the message inside the group.
- * Prefers a phone-number JID (participantAlt carries it when the key is LID-addressed,
- * participant carries it otherwise); only falls back to a LID when nothing else exists.
- */
-function pickParticipantJid(body: GroupMessageBody) {
-  const candidates = [body.key?.participantAlt, body.key?.participant, body.participant].filter(
-    (jid): jid is string => typeof jid === 'string' && jid.trim() !== '',
-  );
-
-  return candidates.find((jid) => !isLidJid(jid)) ?? candidates[0];
-}
+/** Shown when a received group message has no identifiable author (no phone and no name). */
+export const UNKNOWN_PARTICIPANT_LABEL = 'Participante desconhecido';
 
 /**
  * Builds the "**+55 62 9xxxx-xxxx - Name:**" header shown above messages received in a group.
- * Never throws: a LID, an invalid number or a missing participant degrade to the name only
- * (or the raw identifier when there is no name). Messages sent by the instance itself
- * (fromMe) have no header, so an empty string is returned.
+ * Never throws and never presents a LID as a phone number: a LID, an invalid number or a missing
+ * participant degrade to the name only, or to a neutral label when there is no name either.
+ * Messages sent by the instance itself (fromMe) have no header, so an empty string is returned.
  */
 export function formatGroupParticipantHeader(body: GroupMessageBody): string {
   if (body?.key?.fromMe) return '';
 
-  const jid = pickParticipantJid(body ?? {});
-  const number = jid ? jidToNumber(jid) : '';
+  const jid = resolveParticipantPhoneJid(body ?? {});
+  const number = jid ? jid.split('@')[0] : '';
   const phone = number && !isLidJid(jid) ? parsePhoneNumberFromString(`+${number}`)?.formatInternational() : undefined;
-  const name = typeof body?.pushName === 'string' ? body.pushName : '';
+  const name = hasDisplayName(body?.pushName) ? body.pushName.trim() : '';
 
-  const label = [phone, name].filter(Boolean).join(' - ') || number;
+  const label = [phone, name].filter(Boolean).join(' - ') || UNKNOWN_PARTICIPANT_LABEL;
 
-  return label ? `**${label}:**` : '';
+  return `**${label}:**`;
 }
 
 /** Message content sent to Chatwoot for a group message: header (received only) + body. */

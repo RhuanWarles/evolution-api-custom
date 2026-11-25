@@ -15,6 +15,7 @@ import {
   selectPreferredPhoneContact,
 } from '@api/integrations/chatbot/chatwoot/utils/contact-lookup';
 import { buildGroupContactUpdate } from '@api/integrations/chatbot/chatwoot/utils/group-contact-metadata';
+import { hasDisplayName, resolveParticipantPhoneJid } from '@api/integrations/chatbot/chatwoot/utils/group-participant';
 import { buildGroupMessageContent } from '@api/integrations/chatbot/chatwoot/utils/group-participant-header';
 import {
   buildChatwootMessageEditRequest,
@@ -781,36 +782,46 @@ export class ChatwootService {
           const group = await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(chatId);
           this.logger.verbose(`Group metadata: JID:${group.JID} - Subject:${group?.subject || group?.Name}`);
 
-          const participantJid = isLid && !body.key.fromMe ? body.key.participantAlt : body.key.participant;
           nameContact = group.subject;
 
-          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
-            participantJid.split('@')[0],
-          );
-          this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(picture_url)}`);
+          // Only a phone-number JID identifies the author: a LID must never become a contact phone, and a
+          // message without an identifiable author is still delivered to the group conversation.
+          const participantJid = resolveParticipantPhoneJid(body);
+          const participantNumber = participantJid ? participantJid.split('@')[0] : null;
 
-          const findParticipant = await this.findContact(instance, participantJid.split('@')[0]);
-
-          if (findParticipant) {
-            this.logger.verbose(
-              `Found participant: ID:${findParticipant.id} - Name: ${findParticipant.name} - identifier: ${findParticipant.identifier}`,
+          if (!participantNumber) {
+            this.logger.warn(
+              `No identifiable participant for group message ${body.key.id}; skipping participant contact`,
             );
-            if (!findParticipant.name || findParticipant.name === chatId) {
-              await this.updateContact(instance, findParticipant.id, {
-                name: body.pushName,
-                avatar_url: picture_url.profilePictureUrl || null,
-              });
-            }
           } else {
-            await this.createContact(
-              instance,
-              participantJid.split('@')[0].split(':')[0],
-              filterInbox.id,
-              false,
-              body.pushName,
-              picture_url.profilePictureUrl || null,
-              participantJid,
-            );
+            const participantPicture =
+              await this.waMonitor.waInstances[instance.instanceName].profilePicture(participantNumber);
+            const participantPictureUrl = participantPicture?.profilePictureUrl || null;
+            this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(participantPicture)}`);
+
+            const findParticipant = await this.findContact(instance, participantNumber);
+
+            if (findParticipant) {
+              this.logger.verbose(
+                `Found participant: ID:${findParticipant.id} - Name: ${findParticipant.name} - identifier: ${findParticipant.identifier}`,
+              );
+              if ((!findParticipant.name || findParticipant.name === chatId) && hasDisplayName(body.pushName)) {
+                await this.updateContact(instance, findParticipant.id, {
+                  name: body.pushName,
+                  avatar_url: participantPictureUrl,
+                });
+              }
+            } else {
+              await this.createContact(
+                instance,
+                participantNumber,
+                filterInbox.id,
+                false,
+                hasDisplayName(body.pushName) ? body.pushName : undefined,
+                participantPictureUrl,
+                participantJid,
+              );
+            }
           }
         }
 

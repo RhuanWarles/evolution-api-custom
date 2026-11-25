@@ -53,6 +53,7 @@ import {
   TypeButton,
 } from '@api/dto/sendMessage.dto';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { isLidJid, normalizeGroupParticipant } from '@api/integrations/chatbot/chatwoot/utils/group-participant';
 import { extractEditedMessageEvent } from '@api/integrations/chatbot/chatwoot/utils/message-edit';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
@@ -1159,6 +1160,17 @@ export class BaileysStartupService extends ChannelStartupService {
             this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
             continue;
           }
+
+          // Placeholder resends arrive without key.participant/participantAlt/addressingMode.
+          await normalizeGroupParticipant(
+            received,
+            (lid) => this.client.signalRepository.lidMapping.getPNForLID(lid),
+            (error) =>
+              this.logger.warn(
+                `LID lookup failed for group message ${received.key?.id}: ${error instanceof Error ? error.message : 'unknown error'}`,
+              ),
+          );
+
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
             const text = received.message?.conversation || received.message?.extendedTextMessage?.text;
 
@@ -4828,7 +4840,10 @@ export class BaileysStartupService extends ChannelStartupService {
         message.pushName ||
         (message.key.fromMe
           ? 'Você'
-          : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
+          : // never use a JID/LID as the display name
+            message.key?.participant && !isLidJid(message.key.participant)
+            ? message.key.participant.split('@')[0]
+            : null),
       status: status[message.status],
       message: preserveMessageSecret(persistedMessage, messageSecret),
       contextInfo: this.deserializeMessageBuffers(contentMsg?.contextInfo),

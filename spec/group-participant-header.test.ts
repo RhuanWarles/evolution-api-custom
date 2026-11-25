@@ -59,17 +59,17 @@ test('received group message with only a LID falls back to the name without thro
   assert.equal(buildGroupMessageContent(body, 'oi'), '**Maria:**\n\noi');
 });
 
-test('received group message with only a LID and no name falls back to the raw identifier', () => {
+test('received group message with only a LID and no name uses a neutral label, never the LID', () => {
   const body = { key: { fromMe: false, participant: '215041026556054@lid', addressingMode: 'lid' } };
 
-  assert.equal(formatGroupParticipantHeader(body), '**215041026556054:**');
+  assert.equal(formatGroupParticipantHeader(body), '**Participante desconhecido:**');
 });
 
 test('group message without participant in the key does not throw', () => {
   assert.equal(buildGroupMessageContent({ pushName: 'Maria', key: { fromMe: true } }, 'oi'), 'oi');
   assert.equal(buildGroupMessageContent({ pushName: 'Maria', key: { fromMe: false } }, 'oi'), '**Maria:**\n\noi');
-  assert.equal(buildGroupMessageContent({ key: { fromMe: false } }, 'oi'), 'oi');
-  assert.equal(buildGroupMessageContent({}, 'oi'), 'oi');
+  assert.equal(buildGroupMessageContent({ key: { fromMe: false } }, 'oi'), '**Participante desconhecido:**\n\noi');
+  assert.equal(buildGroupMessageContent({}, 'oi'), '**Participante desconhecido:**\n\noi');
 });
 
 test('uses body.participant when the key has no participant', () => {
